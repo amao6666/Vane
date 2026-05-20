@@ -1,13 +1,10 @@
-# === CMake 构建中间产物 ===
-build/**/CMakeFiles/
-build/**/CMakeCache.txt
-build/**/Makefile
-build/**/cmake_install.cmake
-build/**/*.cmake
-build/**/*.check_cache
-build/**/*.marks
-build/**/InstallScripts.json
-build/**/TargetDirectories.txt
+# === 外部 SDK（本地留存，不入库） ===
+AVCodecs/
+Video_Codec_SDK_13.0.37/
+third_party/
+
+# === CMake 构建产物 ===
+build/
 
 # === 编译中间文件 ===
 *.o
@@ -25,6 +22,8 @@ build/**/TargetDirectories.txt
 
 # === 测试输出 ===
 *.mp4
+*.wmv
+test_enc_*
 
 # === macOS ===
 .DS_Store

@@ -42,6 +42,13 @@ public:
     // 获取最后一次错误的描述信息
     virtual const char* GetLastError() const = 0;
 
+    // 检测当前系统编码器能力（Initialize 之前即可调用）
+    virtual FEncoderCapability CheckCapability() const = 0;
+
+    // 设置 D3D11 Device（Windows 平台，非 Windows 平台无操作）
+    // 必须在 Initialize 之前调用；传入 nullptr 表示取消
+    virtual void SetD3D11Device(void* /*pDevice*/) {}
+
     // ---- 回调注册接口 ----
     // 回调触发线程说明见 VaneCallbacks.h，UE 用户必须将回调转发到 GameThread 才能操作 UI
     // UserData 指针必须保证在录制期间有效

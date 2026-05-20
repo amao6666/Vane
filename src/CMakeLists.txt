@@ -5,9 +5,15 @@ option(VANE_TEST_ENCODING_DELAY_MS "Inject encoding delay (ms) for testing (0 = 
 # ---- Vane 编码器库 ----
 if(VANE_BUILD_SHARED)
     add_library(Vane SHARED)
-    target_compile_definitions(Vane PRIVATE VANE_EXPORTS)
 else()
     add_library(Vane STATIC)
+endif()
+# 构建库时始终定义 VANE_EXPORTS（静态库时 __declspec(dllexport) 无害）
+target_compile_definitions(Vane PRIVATE VANE_EXPORTS)
+
+# MSVC 需要显式指定 UTF-8 源文件编码（避免中文注释/字符串的 C2001/C4819 错误）
+if(MSVC)
+    target_compile_options(Vane PRIVATE /utf-8)
 endif()
 
 target_include_directories(Vane
@@ -31,6 +37,12 @@ endif()
 target_sources(Vane PRIVATE
     VaneAPI.cpp
     AsyncPipeline.cpp
+    core/MP4Writer.cpp
+    core/MP4Writer.h
+    core/ColorSpaceConverter.cpp
+    core/ColorSpaceConverter.h
+    core/D3D11Converter.cpp
+    core/D3D11Converter.h
 )
 
 # ---- 平台分支 ----
@@ -59,13 +71,31 @@ if(PLATFORM_MAC)
 elseif(PLATFORM_WINDOWS)
     target_compile_definitions(Vane PRIVATE PLATFORM_WINDOWS=1)
 
-    target_sources(Vane PRIVATE FMFEncoder.cpp)
+    target_include_directories(Vane PRIVATE
+        ${CMAKE_SOURCE_DIR}/third_party/nvenc
+    )
+
+    target_sources(Vane PRIVATE
+        # 新架构：FWindowsEncoder 门面 + 三路编码器
+        windows/FWindowsEncoder.cpp
+        windows/FWindowsEncoder.h
+        windows/FNvencEncoder.cpp
+        windows/FNvencEncoder.h
+        windows/FAmfEncoder.cpp
+        windows/FAmfEncoder.h
+        windows/FMFEncoderNew.cpp
+        windows/FMFEncoderNew.h
+        windows/MFUtils.h
+        # 保留旧版 FMFEncoder（不编译，仅作参考）
+        # FMFEncoder.cpp
+    )
 
     target_link_libraries(Vane PUBLIC
         mfplat
         mfreadwrite
         mfuuid
         ole32
+        d3d11
     )
 elseif(PLATFORM_LINUX)
     target_compile_definitions(Vane PRIVATE PLATFORM_LINUX=1)

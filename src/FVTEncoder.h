@@ -19,6 +19,7 @@ public:
     void RequestStop() override;
     bool IsRecording() const override;
     const char* GetLastError() const override;
+    FEncoderCapability CheckCapability() const override;
 
     void SetStateCallback(VaneStateCallback Cb, void* UserData) override;
     void SetErrorCallback(VaneErrorCallback Cb, void* UserData) override;

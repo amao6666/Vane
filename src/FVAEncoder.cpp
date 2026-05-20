@@ -508,5 +508,16 @@ const char* FVAEncoder::GetLastError() const
     return Impl->LastError.c_str();
 }
 
+FEncoderCapability FVAEncoder::CheckCapability() const
+{
+    FEncoderCapability cap;
+    cap.bH264Available = true;
+    cap.bHEVCAvailable = true;
+    cap.H264EncoderName = "VA-API (Linux)";
+    cap.RecommendedFormat = "h264";
+    cap.DiagnosticInfo = "Linux VA-API: H.264/H.265 硬件编码（取决于驱动支持）";
+    return cap;
+}
+
 // TODO: 实现回调通知（SetStateCallback / SetErrorCallback / SetProgressCallback / SetFrameDropCallback）
 // 当前使用 IVideoEncoder 基类默认空实现，后续需要覆盖并在适当位置触发回调。

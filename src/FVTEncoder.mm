@@ -568,6 +568,17 @@ const char* FVTEncoder::GetLastError() const
     return Impl->LastError.c_str();
 }
 
+FEncoderCapability FVTEncoder::CheckCapability() const
+{
+    FEncoderCapability cap;
+    cap.bH264Available = true;
+    cap.bHEVCAvailable = true;
+    cap.H264EncoderName = "VideoToolbox (macOS)";
+    cap.RecommendedFormat = "h264";
+    cap.DiagnosticInfo = "macOS VideoToolbox: H.264/H.265 硬件编码始终可用";
+    return cap;
+}
+
 void FVTEncoder::SetStateCallback(VaneStateCallback Cb, void* UserData)
 {
     Impl->StateCb     = Cb;

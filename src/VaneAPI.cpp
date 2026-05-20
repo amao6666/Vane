@@ -3,7 +3,7 @@
 #if defined(PLATFORM_MAC)
     #include "FVTEncoder.h"
 #elif defined(PLATFORM_WINDOWS)
-    #include "FMFEncoder.h"
+    #include "windows/FWindowsEncoder.h"
 #elif defined(PLATFORM_LINUX)
     #include "FVAEncoder.h"
 #endif
@@ -15,7 +15,7 @@ VANE_API void* VaneEncoder_Create(void)
 #if defined(PLATFORM_MAC)
     return new FVTEncoder();
 #elif defined(PLATFORM_WINDOWS)
-    return new FMFEncoder();
+    return new FWindowsEncoder();
 #elif defined(PLATFORM_LINUX)
     return new FVAEncoder();
 #else
@@ -69,6 +69,35 @@ VANE_API const char* VaneEncoder_GetLastError(void* Encoder)
     auto* enc = static_cast<IVideoEncoder*>(Encoder);
     return enc ? enc->GetLastError() : "Encoder handle is null";
 }
+
+VANE_API int VaneEncoder_CheckCapability(void* Encoder, FEncoderCapability* OutCap)
+{
+    auto* enc = static_cast<IVideoEncoder*>(Encoder);
+    if (!enc || !OutCap) return 0;
+    *OutCap = enc->CheckCapability();
+    return 1;
+}
+
+#ifdef _WIN32
+VANE_API int VaneEncoder_SetD3D11Device(void* Encoder, void* pD3D11Device)
+{
+    auto* enc = static_cast<IVideoEncoder*>(Encoder);
+    if (!enc) return 0;
+    enc->SetD3D11Device(pD3D11Device);
+    return 1;
+}
+
+VANE_API int VaneEncoder_GetEncoderType(void* Encoder)
+{
+#if PLATFORM_WINDOWS
+    auto* enc = static_cast<FWindowsEncoder*>(Encoder);
+    return enc ? static_cast<int>(enc->GetEncoderType()) : -1;
+#else
+    (void)Encoder;
+    return -1;
+#endif
+}
+#endif
 
 VANE_API void VaneEncoder_SetStateCallback(void* Encoder, VaneStateCallback Cb, void* UserData)
 {

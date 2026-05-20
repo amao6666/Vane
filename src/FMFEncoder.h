@@ -19,10 +19,16 @@ public:
     void RequestStop() override;
     bool IsRecording() const override;
     const char* GetLastError() const override;
+    FEncoderCapability CheckCapability() const override;
 
-private:
-    FMFEncoderImpl* Impl;
+    void SetStateCallback(VaneStateCallback Cb, void* UserData) override;
+    void SetErrorCallback(VaneErrorCallback Cb, void* UserData) override;
+    void SetProgressCallback(VaneProgressCallback Cb, void* UserData) override;
+    void SetFrameDropCallback(VaneFrameDropCallback Cb, void* UserData) override;
 
     // MF 引用计数，确保 MFStartup / MFShutdown 只调用一次
     static int32 MFRefCount;
+
+private:
+    FMFEncoderImpl* Impl;
 };

@@ -1,208 +1,164 @@
 # Vane
 
-跨平台视频编码抽象库，为各平台硬件编码器提供统一的 C++17 接口，附带 C ABI 导出层用于 UE 等引擎集成。
+跨平台视频编码抽象库，为各平台硬件编码器提供统一的 C++17 接口，附带 C ABI 导出层用于 UE 等引擎集成。MIT 许可证。
 
 ## 平台支持
 
 | 平台 | 底层 API | 输出格式 | 状态 |
 |------|---------|----------|------|
-| macOS | VideoToolbox | H.264 + MP4 (fMP4) | ✅ 已实现 |
-| Windows | Media Foundation | H.264 + MP4 | ✅ 已实现 |
-| Linux | VA-API | H.264 + MP4 (内置复用器) | ✅ 已实现 |
+| macOS | VideoToolbox | H.264 + fMP4 (AVAssetWriter) | ✅ |
+| Windows | NVENC → AMF → MF | H.264 + MP4 | ✅ |
+| Linux | VA-API | H.264 + fMP4 (内置复用器) | ✅ |
 
-## 架构设计
+Windows 采用运行时硬件探测，按优先级自动选择：NVIDIA NVENC > AMD AMF > Media Foundation。MF 路径还提供 WMV 格式兜底。
 
-```
-┌─────────────────────────────────────────────────┐
-│                  公开接口层                       │
-│  C++: IVideoEncoder    C ABI: VaneAPI.h          │
-│  Initialize / StartRecording / EncodeFrame       │
-│  StopRecording / RequestStop / GetLastError      │
-│  SetStateCallback / SetErrorCallback / ...       │
-├─────────────────────────────────────────────────┤
-│                  平台实现层                       │
-│  FVTEncoder.mm (VideoToolbox)                    │
-│  FMFEncoder.cpp (Media Foundation)               │
-│  FVAEncoder.cpp (VA-API + MP4Muxer)              │
-├─────────────────────────────────────────────────┤
-│                 异步管线层                        │
-│  FAsyncEncodingPipeline + FFrameQueue (SPSC)     │
-│  帧采样节流 / 丢旧保新 / LastFrame续命            │
-│  cv唤醒 / atomic无锁 / 周期刷盘                   │
-└─────────────────────────────────────────────────┘
-```
-
-### 帧流转路径
+## 架构
 
 ```
-游戏线程                         编码线程                       系统 API
-───────                         ────────                       ────────
-EncodeFrame()                   EncodeLoop()
-  │                               │
-  ├─ PushFrameRaw() ──memcpy──→  FFrameQueue (ring buffer)
-  │  (0.5ms)                      │
-  └─ notify_one() ──────────────→ cv.wake ── TryPop (零拷贝指针)
-                                  │
-                                  ├─ CVPixelBufferCreate (10μs)
-                                  ├─ memcpy → pixelBuf (0.5ms)
-                                  ├─ VTCompressionSessionEncodeFrame (0.2ms)
-                                  ├─ CompressionOutputCallback
-                                  │   └─ AVAssetWriter appendSampleBuffer
-                                  ├─ ProgressCallback (每秒)
-                                  └─ FlushCallback (每60帧)
+                         ┌──────────────────────┐
+                         │   FEncoderConfig      │
+                         │ (分辨率/帧率/码率/..)  │
+                         └──────────┬───────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    │      VaneAPI.cpp (C ABI)       │
+                    │  Create / Initialize / Encode  │
+                    └───────────────┬───────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            │                       │                       │
+    ┌───────┴───────┐    ┌─────────┴─────────┐    ┌───────┴───────┐
+    │  FVTEncoder    │    │ FWindowsEncoder   │    │  FVAEncoder    │
+    │  (VideoToolbox)│    │ (门面: 运行时探测) │    │  (VA-API)      │
+    └───────────────┘    └─────────┬─────────┘    └───────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    │              │              │
+            ┌───────┴──────┐ ┌────┴─────┐ ┌──────┴──────┐
+            │ FNvencEncoder │ │FAmfEncoder│ │FMFEncoderNew│
+            │ (NVENC SDK)   │ │ (AMF SDK) │ │  (MF H.264  │
+            │ LoadLibrary   │ │           │ │  + WMV 兜底)│
+            └───────────────┘ └───────────┘ └─────────────┘
+                    │
+            ┌───────┴───────┐
+            │ D3D11Converter │
+            │ (BGRA→NV12 GPU)│
+            └───────────────┘
+
+                    跨平台核心
+            ┌─────────────────────┐
+            │  AsyncPipeline       │
+            │  (SPSC 无锁环形队列)  │
+            ├─────────────────────┤
+            │  MP4Writer           │
+            │  (Annex B → avc1)    │
+            ├─────────────────────┤
+            │  ColorSpaceConverter │
+            │  (BGRA → NV12 CPU)   │
+            └─────────────────────┘
 ```
 
-### 回调系统
+## 源码结构
 
-| 回调 | 触发线程 | 频率 | 用途 |
-|------|---------|------|------|
-| `StateCallback` | 调用线程 / 编码线程 | 状态变化时 | 录制生命周期通知 (Idle→Recording→Stopping→Idle) |
-| `ErrorCallback` | 编码线程 | 出错时 | 错误级别 + 描述信息 |
-| `ProgressCallback` | 编码线程 | 1 Hz | 已编码帧数 / 字节数 / 时间戳 |
-| `FrameDropCallback` | 游戏线程 | 丢帧时 | 累计丢帧数 |
+```
+include/Vane/          # 公开头文件
+  IVideoEncoder.h      # C++ 抽象接口
+  VaneConfig.h         # 配置 + 能力检测
+  VaneCallbacks.h      # C 风格回调类型
+  VaneAPI.h            # C ABI 导出接口
 
-### 线程模型
+src/
+  VaneAPI.cpp          # C ABI 实现（#if PLATFORM_XXX 创建编码器）
+  AsyncPipeline.cpp    # 异步管线（所有平台共用）
+  core/                # 跨平台核心
+    MP4Writer.cpp/h    # MP4 封装器
+    ColorSpaceConverter.cpp/h  # 色彩空间转换
+    D3D11Converter.cpp/h       # GPU BGRA→NV12
 
-| 组件 | 线程 | 阻塞 | 关键操作 |
-|------|------|------|---------|
-| `EncodeFrame` | 游戏线程 | 否 | memcpy + atomic push + notify |
-| `RequestStop` | 调用线程 | 否 | 设置停止信号，立即返回 |
-| `StopRecording` | 调用线程 | 是 | 等待编码线程排空后同步收尾 |
-| 编码回调 | 编码线程 | — | CVPixelBuffer + VT encode + AVAssetWriter append |
-| 状态回调 | 编码/调用线程 | — | UE 集成需 `AsyncTask(GameThread)` 转发 |
-| 进度回调 | 编码线程 | — | UE 集成需 `AsyncTask(GameThread)` 转发 |
-| 丢帧回调 | 游戏线程 | — | 可直接操作 UE 对象 |
+  FVTEncoder.h/.mm     # macOS VideoToolbox
+  FVAEncoder.h/.cpp    # Linux VA-API
+  windows/             # Windows 多编码器
+    FWindowsEncoder.cpp/h    # 门面（NVENC > AMF > MF）
+    FNvencEncoder.cpp/h      # NVENC 原生编码器
+    FAmfEncoder.cpp/h        # AMD AMF 编码器
+    FMFEncoderNew.cpp/h      # Media Foundation 编码器
+    MFUtils.h                # MF 公共工具
 
-## API
-
-### C++ 接口 (IVideoEncoder)
-
-```cpp
-#include "Vane/IVideoEncoder.h"
-#include "Vane/VaneConfig.h"
-
-FEncoderConfig cfg;
-cfg.Width = 1920; cfg.Height = 1080; cfg.FrameRate = 60;
-cfg.BitRate = 10'000'000;
-
-FVTEncoder encoder;
-encoder.Initialize(cfg);
-encoder.SetStateCallback(OnState, &userData);
-encoder.StartRecording("output.mp4");
-
-// 游戏线程，每帧调用
-encoder.EncodeFrame(bgraData, dataSize, timestampSeconds);
-
-encoder.RequestStop();  // 异步，不阻塞
+test/
+  main.cpp             # 主测试（四场景：丢帧/卡顿/异步Stop/吞吐量）
+  test_mp4writer.cpp   # MP4Writer 单元测试
+  test_d3d11.cpp       # D3D11 设备测试
+  test_all_encoders.cpp # 全编码器遍历验证
 ```
 
-### C ABI (跨 DLL / FFI)
+## 构建与测试
+
+```bash
+# 构建
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# 运行主测试
+./build/test/VaneTest
+
+# Windows 上的专项测试
+./build/test/Release/AllEncodersTest.exe  # 全编码器验证
+./build/test/Release/Mp4WriterTest.exe    # MP4Writer 单元测试
+./build/test/Release/D3D11Test.exe        # D3D11 设备测试
+
+# 带编码延迟的压力测试
+cmake -S . -B build -DVANE_TEST_ENCODING_DELAY_MS=80 && cmake --build build
+```
+
+| CMake 选项 | 默认值 | 说明 |
+|---|---|---|
+| `VANE_BUILD_SHARED` | ON | ON=动态库, OFF=静态库 |
+| `VANE_TEST_ENCODING_DELAY_MS` | 0 | 注入人工编码延迟(ms)，0=关闭 |
+| `VANE_DEBUG_TIMING` | OFF | 编码管线计时诊断日志 |
+
+## C ABI 接口
 
 ```c
 #include "Vane/VaneAPI.h"
 
 void* h = VaneEncoder_Create();
-VaneEncoder_Initialize(h, &config);
+#ifdef _WIN32
+VaneEncoder_SetD3D11Device(h, pD3D11Device);  // 可选：指定 GPU
+#endif
+VaneEncoder_Initialize(h, &cfg);
 VaneEncoder_StartRecording(h, "output.mp4");
 VaneEncoder_EncodeFrame(h, bgra, size, timestamp);
-VaneEncoder_RequestStop(h);
+VaneEncoder_RequestStop(h);  // 异步，回调通知完成
 VaneEncoder_Destroy(h);
 ```
 
-### 配置结构体
+## 回调系统
 
-| 字段 | 默认值 | 说明 |
-|------|--------|------|
-| `Width` / `Height` | 1920 / 1080 | 输出分辨率 |
-| `FrameRate` | 60 | 编码帧率 |
-| `BitRate` | 10'000'000 | 目标码率 (bps) |
-| `KeyframeInterval` | 120 | I 帧间隔 |
-| `bRealTime` | true | 低延迟模式 |
-| `RecordFrameRate` | 60 | 录制目标帧率（0=不节流） |
-| `FrameQueueSize` | 32 | 异步队列槽位数 |
-| `FlushIntervalFrames` | 60 | fMP4 分片间隔 |
-| `bContinueLastFrame` | false | 队列空时用最后一帧续命 |
+| 回调 | 线程 | 频率 | 用途 |
+|------|------|------|------|
+| `StateCallback` | 编码线程 | 状态变化时 | Idle→Starting→Recording→Stopping→Idle |
+| `ErrorCallback` | 编码线程 | 出错时 | 错误/警告级别 + 描述 |
+| `ProgressCallback` | 编码线程 | 1 Hz | 已编码帧数/字节数/时间戳 |
+| `FrameDropCallback` | 游戏线程 | 丢帧时 | 累计丢帧数 |
 
-## 性能指标
+## 关键设计决策
 
-> 测试环境：macOS, Apple Silicon M1, Release 编译, 1080p BGRA → H.264 60fps
+- **PIMPL**：所有编码器类头文件只暴露接口，实现细节在 .cpp 中
+- **动态加载 (NVENC)**：通过 `LoadLibrary("nvEncodeAPI64.dll")` 加载，编译期零 SDK 依赖
+- **门面模式 (Windows)**：`FWindowsEncoder` 运行时探测硬件 → 选择最佳编码器
+- **真实编码会话探测 (NVENC)**：`IsH264Supported()` 打开临时编码会话验证，按 D3D11 设备指针缓存
+- **MF 引用计数**：`MFStartup`/`MFShutdown` 通过静态引用计数管理
+- **异步管线**：SPSC 无锁环形队列 + `condition_variable` 唤醒 + `alignas(64)` 消除伪共享
 
-| 指标 | 数值 |
-|------|------|
-| 单帧编码回调耗时 | **250–300 μs** |
-| 主线程 EncodeFrame 耗时 | ~0.5 ms (1×memcpy 8MB) |
-| 编码线程唤醒延迟 | <100 μs (condition_variable) |
-| 600 帧连续录制 | 零丢帧，吞吐量 60 fps |
-| `RequestStop` 返回时间 | <0.1 ms |
-| 队列最大深度 | 32（可配置） |
+## 各平台封装方式
 
-## 已实现的优化
-
-| 优化项 | 说明 |
-|--------|------|
-| 无锁环形队列 | SPSC，双 `std::atomic` 索引，`condition_variable` 即时唤醒 |
-| 真实时间戳 | `double TimestampSeconds` 取代帧序号推导，卡顿后视频时间连续 |
-| 帧采样节流 | 录制帧率与输入帧率解耦，避免无效帧入队 |
-| 异步 RequestStop | 不阻塞调用线程，收尾完成通过 StateCallback(Idle) 通知 |
-| LastFrame 续命 | 主线程卡顿时编码线程用最后一帧填充，视频画面定格不黑屏 |
-| fMP4 分片写入 | `movieFragmentInterval=1s`，崩溃后已写入部分可播 |
-| 丢旧保新 | 队列满时丢弃最旧帧，保证最新画面优先和视频时间连续 |
-| 零拷贝出队 | TryPop 返回 slot 内部指针，消除一次 8MB memcpy |
-| CAVLC + B 帧关闭 | `AllowFrameReordering=false`，保证输出顺序与输入一致 |
-| 最终进度刷新 | 停止时强制发送最后一次 ProgressCallback |
-
-## 待完成
-
-| 项目 | 说明 |
-|------|------|
-| Windows 低延迟参数对齐 | `MF_LOW_LATENCY` + `RequestStop` 异步化 |
-| Linux 低延迟参数对齐 | VA-API `RequestStop` + 编码参数调整 |
-| 三平台统一压力测试 | 120fps 输入 / 长时间录制 / OOM 边界 |
-| UE 插件层 | `Build.cs` + 游戏线程回调转发封装 |
-| IOSurface 零拷贝 (v2) | 消除 memcpy 链，直接包装渲染纹理 |
-
-## 构建与测试
-
-### 构建
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-| 选项 | 默认 | 说明 |
-|------|------|------|
-| `VANE_BUILD_SHARED` | ON | ON=动态库, OFF=静态库 |
-| `VANE_TEST_ENCODING_DELAY_MS` | 0 | 测试用人工编码延迟 (ms)，0=关闭 |
-| `VANE_DEBUG_TIMING` | OFF | 编码管线计时诊断日志 |
-
-### 测试
-
-```bash
-# 基础测试（四场景：丢帧 / 卡顿 / 异步Stop / 吞吐量）
-./build/test/VaneTest
-
-# 带编码延迟的压力测试
-cmake -S . -B build -DVANE_TEST_ENCODING_DELAY_MS=80 && cmake --build build && ./build/test/VaneTest
-```
-
-### UE 集成
-
-```
-MyPlugin/ThirdParty/Vane/
-├── include/Vane/VaneAPI.h
-├── lib/Win64/Vane.dll + Vane.lib
-├── lib/Mac/libVane.dylib
-└── lib/Linux/libVane.so
-```
-
-```csharp
-// MyPlugin.Build.cs
-if (Target.Platform == UnrealTargetPlatform.Win64) {
-    PublicAdditionalLibraries.Add(Path.Combine(ModuleDir, "Vane/lib/Win64/Vane.lib"));
-    RuntimeDependencies.Add("$(BinaryOutputDir)/Vane.dll", Path.Combine(ModuleDir, "Vane/lib/Win64/Vane.dll"));
-}
-```
+| 平台 | 编码器 | 封装 |
+|---|---|---|
+| macOS | VideoToolbox | AVAssetWriter 直接写 fMP4 |
+| Windows NVENC/AMF | NVENC/AMF SDK | 输出 Annex B → MP4Writer 封装 |
+| Windows MF H.264 | Media Foundation MFT | 输出 Annex B → MP4Writer 封装 |
+| Windows MF WMV | Media Foundation SinkWriter | 直接写 ASF 文件 |
+| Linux | VA-API | 输出 Annex B → MP4Muxer 封装 fMP4 |
 
 ## 许可证
 

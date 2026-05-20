@@ -59,6 +59,18 @@ VANE_API int   VaneEncoder_IsRecording(void* Encoder);
 // 获取最后一次错误的描述信息（返回字符串生命周期由编码器实例持有）
 VANE_API const char* VaneEncoder_GetLastError(void* Encoder);
 
+// 检测编码器能力（Initialize 之前即可调用）
+VANE_API int   VaneEncoder_CheckCapability(void* Encoder, FEncoderCapability* OutCap);
+
+// ---- Windows 平台扩展 ----（仅在 _WIN32 下可用）
+#ifdef _WIN32
+// 设置 D3D11 Device（必须在 Initialize 之前调用）
+VANE_API int   VaneEncoder_SetD3D11Device(void* Encoder, void* pD3D11Device);
+
+// 获取当前使用的编码器类型
+VANE_API int   VaneEncoder_GetEncoderType(void* Encoder);
+#endif
+
 // ---- 回调注册 ----
 VANE_API void VaneEncoder_SetStateCallback(void* Encoder, VaneStateCallback Cb, void* UserData);
 VANE_API void VaneEncoder_SetErrorCallback(void* Encoder, VaneErrorCallback Cb, void* UserData);
