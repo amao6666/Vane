@@ -4,13 +4,14 @@
 
 #include "Vane/VaneConfig.h"
 #include "Vane/VaneCallbacks.h"
+#include "Vane/VaneAPI.h"
 
 // 类型别名
 using int32 = int32_t;
 using uint8 = uint8_t;
 
 // 平台无关的视频编码器抽象接口
-class IVideoEncoder
+class VANE_API IVideoEncoder
 {
 public:
     virtual ~IVideoEncoder() = default;

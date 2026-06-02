@@ -25,7 +25,7 @@ enum class EWindowsEncoderType
 
 // Windows 平台编码器门面
 // 运行时探测硬件 → 选择最佳编码器（NVENC > AMF > MF）
-class FWindowsEncoder : public IVideoEncoder
+class VANE_API FWindowsEncoder : public IVideoEncoder
 {
 public:
     FWindowsEncoder();

@@ -71,8 +71,26 @@ if(PLATFORM_MAC)
 elseif(PLATFORM_WINDOWS)
     target_compile_definitions(Vane PRIVATE PLATFORM_WINDOWS=1)
 
+    # 自动下载 NVIDIA NVENC 头文件（FFmpeg 维护的 MIT 许可镜像，~200KB）
+    set(NVENC_HEADER_DIR ${CMAKE_BINARY_DIR}/nv-codec-headers/include/ffnvcodec)
+    if(NOT EXISTS ${NVENC_HEADER_DIR}/nvEncodeAPI.h)
+        file(MAKE_DIRECTORY ${NVENC_HEADER_DIR})
+        file(DOWNLOAD
+            https://raw.githubusercontent.com/FFmpeg/nv-codec-headers/master/include/ffnvcodec/nvEncodeAPI.h
+            ${NVENC_HEADER_DIR}/nvEncodeAPI.h
+            STATUS DOWNLOAD_STATUS
+        )
+        list(GET DOWNLOAD_STATUS 0 STATUS_CODE)
+        if(NOT STATUS_CODE EQUAL 0)
+            list(GET DOWNLOAD_STATUS 1 STATUS_MSG)
+            message(FATAL_ERROR "无法下载 nvEncodeAPI.h: ${STATUS_MSG}\n"
+                "请手动下载: git clone --depth 1 https://github.com/FFmpeg/nv-codec-headers.git\n"
+                "并放到 ${NVENC_HEADER_DIR}/")
+        endif()
+    endif()
+
     target_include_directories(Vane PRIVATE
-        ${CMAKE_SOURCE_DIR}/third_party/nv-codec-headers/include/ffnvcodec
+        ${CMAKE_BINARY_DIR}/nv-codec-headers/include/ffnvcodec
     )
 
     target_sources(Vane PRIVATE
