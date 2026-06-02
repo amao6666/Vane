@@ -1,5 +1,5 @@
 #include "FMFEncoder.h"
-#include "AsyncPipeline.h"
+#include "core/AsyncPipeline.h"
 
 #include <windows.h>
 #include <mfapi.h>

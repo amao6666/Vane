@@ -1,11 +1,11 @@
 #include "Vane/VaneAPI.h"
 
 #if defined(PLATFORM_MAC)
-    #include "FVTEncoder.h"
+    #include "mac/FVTEncoder.h"
 #elif defined(PLATFORM_WINDOWS)
     #include "windows/FWindowsEncoder.h"
 #elif defined(PLATFORM_LINUX)
-    #include "FVAEncoder.h"
+    #include "linux/FVAEncoder.h"
 #endif
 
 extern "C" {

@@ -2,7 +2,7 @@
 #include "windows/FNvencEncoder.h"
 #include "windows/FAmfEncoder.h"
 #include "windows/FMFEncoderNew.h"
-#include "core/D3D11Converter.h"
+#include "D3D11Converter.h"
 
 #include <cstring>
 #include <thread>

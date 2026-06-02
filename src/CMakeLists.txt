@@ -42,13 +42,12 @@ endif()
 # 跨平台核心（始终编译）
 target_sources(Vane PRIVATE
     VaneAPI.cpp
-    AsyncPipeline.cpp
+    core/AsyncPipeline.cpp
+    core/AsyncPipeline.h
     core/MP4Writer.cpp
     core/MP4Writer.h
     core/ColorSpaceConverter.cpp
     core/ColorSpaceConverter.h
-    core/D3D11Converter.cpp
-    core/D3D11Converter.h
 )
 
 # ---- 平台分支 ----
@@ -61,7 +60,7 @@ if(PLATFORM_MAC)
     find_library(AVFOUNDATION_FWK AVFoundation REQUIRED)
     find_library(FOUNDATION_FWK   Foundation  REQUIRED)
 
-    target_sources(Vane PRIVATE FVTEncoder.mm)
+    target_sources(Vane PRIVATE mac/FVTEncoder.mm)
 
     target_compile_options(Vane PRIVATE
         $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
@@ -110,6 +109,8 @@ elseif(PLATFORM_WINDOWS)
         windows/FMFEncoderNew.cpp
         windows/FMFEncoderNew.h
         windows/MFUtils.h
+        windows/D3D11Converter.cpp
+        windows/D3D11Converter.h
         # 保留旧版 FMFEncoder（不编译，仅作参考）
         # FMFEncoder.cpp
     )
@@ -128,8 +129,8 @@ elseif(PLATFORM_LINUX)
     find_library(LIBVA_DRM_LIB va-drm REQUIRED)
 
     target_sources(Vane PRIVATE
-        FVAEncoder.cpp
-        MP4Muxer.cpp
+        linux/FVAEncoder.cpp
+        linux/MP4Muxer.cpp
     )
 
     target_link_libraries(Vane PUBLIC ${LIBVA_LIB} ${LIBVA_DRM_LIB})

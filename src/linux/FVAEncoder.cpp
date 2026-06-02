@@ -1,5 +1,5 @@
 #include "FVAEncoder.h"
-#include "AsyncPipeline.h"
+#include "core/AsyncPipeline.h"
 #include "MP4Muxer.h"
 
 #include <cstdio>

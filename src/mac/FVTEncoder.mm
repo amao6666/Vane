@@ -6,7 +6,7 @@
 #undef Height
 
 #include "FVTEncoder.h"
-#include "AsyncPipeline.h"
+#include "core/AsyncPipeline.h"
 #include <dispatch/dispatch.h>
 #include <string>
 #include <cstring>

@@ -12,7 +12,7 @@
 #include "windows/MFUtils.h"
 #include "core/MP4Writer.h"
 #include "core/ColorSpaceConverter.h"
-#include "AsyncPipeline.h"
+#include "core/AsyncPipeline.h"
 
 // 编码器类型
 enum class EWindowsEncoderType

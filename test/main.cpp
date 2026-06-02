@@ -1,11 +1,11 @@
 #if defined(__APPLE__)
-    #include "FVTEncoder.h"
+    #include "mac/FVTEncoder.h"
     using FPlatformEncoder = FVTEncoder;
 #elif defined(_WIN32)
     #include "FMFEncoder.h"
     using FPlatformEncoder = FMFEncoder;
 #elif defined(__linux__)
-    #include "FVAEncoder.h"
+    #include "linux/FVAEncoder.h"
     using FPlatformEncoder = FVAEncoder;
 #else
     #error "Unsupported platform"
