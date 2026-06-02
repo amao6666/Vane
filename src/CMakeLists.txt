@@ -72,7 +72,7 @@ elseif(PLATFORM_WINDOWS)
     target_compile_definitions(Vane PRIVATE PLATFORM_WINDOWS=1)
 
     target_include_directories(Vane PRIVATE
-        ${CMAKE_SOURCE_DIR}/third_party/nvenc
+        ${CMAKE_SOURCE_DIR}/third_party/nv-codec-headers/include/ffnvcodec
     )
 
     target_sources(Vane PRIVATE
