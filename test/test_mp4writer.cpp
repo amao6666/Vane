@@ -8,6 +8,12 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+
+#ifdef _WIN32
+#define DeleteTestFile(p) DeleteTestFile(p)
+#else
+#define DeleteTestFile(p) remove(p)
+#endif
 #include <cassert>
 
 #ifdef _WIN32
@@ -294,7 +300,7 @@ static void TestWriteAndFinalize()
         frames.push_back(frame);
     }
 
-    DeleteFileA("test_mp4writer_output.mp4");
+    DeleteTestFile("test_mp4writer_output.mp4");
 
     {
         MP4Writer w;
@@ -444,10 +450,10 @@ static void TestEmptyFrames()
     headerOnlyFrame.insert(headerOnlyFrame.end(), sc, sc + 4);
     headerOnlyFrame.insert(headerOnlyFrame.end(), pps.begin(), pps.end());
 
-    DeleteFileA("test_mp4writer_empty.mp4");
+    DeleteTestFile("test_mp4writer_empty.mp4");
     {
         FILE* check = fopen("test_mp4writer_empty.mp4", "rb");
-        if (check) { fclose(check); DeleteFileA("test_mp4writer_empty.mp4"); }
+        if (check) { fclose(check); DeleteTestFile("test_mp4writer_empty.mp4"); }
     }
     {
         MP4Writer w;

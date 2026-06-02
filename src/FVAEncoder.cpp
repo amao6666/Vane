@@ -1,11 +1,15 @@
 #include "FVAEncoder.h"
+#include "AsyncPipeline.h"
 #include "MP4Muxer.h"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <chrono>
+#include <thread>
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 
 #include <va/va.h>
 #include <va/va_drm.h>
@@ -56,12 +60,16 @@ static void ConvertBGRAToNV12(const uint8* bgra, int32 width, int32 height,
 // ============================================================================
 struct FVAEncoderImpl
 {
-    int32 Width       = 0;
-    int32 Height      = 0;
-    int32 FrameCount  = 0;
-    int32 BitRate     = 10000000;
-    int32 KeyInterval = 120;
+    int32 Width        = 0;
+    int32 Height       = 0;
+    int32 FrameRate    = 60;
+    int32 RecordFrameRate = 60;
+    int32 BitRate      = 10000000;
+    int32 KeyInterval  = 120;
+    int32 QueueSize    = 32;
     int32 FlushInterval = 60;
+    bool  bContinueLastFrame = false;
+    int32 LastDroppedCount   = 0;
 
     // VA-API 对象
     int          DrmFd       = -1;
@@ -73,13 +81,35 @@ struct FVAEncoderImpl
     static constexpr int32 SurfaceCount = 4;
     VASurfaceID Surfaces[SurfaceCount];
 
-    // 输出
+    // 异步管线（编码线程执行 VA-API 操作）
+    FAsyncEncodingPipeline Pipeline;
+
+    // 输出（编码线程持有）
     MP4Muxer  Muxer;
     std::string OutputPath;
+
+    // 编码线程帧计数器（取代主线程 FrameCount，用于 surface 轮转）
+    std::atomic<int64_t> EncodedCount{0};
+
+    // 回调
+    VaneStateCallback    StateCb    = nullptr;
+    VaneErrorCallback    ErrorCb    = nullptr;
+    VaneProgressCallback ProgressCb = nullptr;
+    VaneFrameDropCallback FrameDropCb = nullptr;
+    void* StateUserData    = nullptr;
+    void* ErrorUserData    = nullptr;
+    void* ProgressUserData = nullptr;
+    void* FrameDropUserData = nullptr;
+
+    // 进度统计（编码线程更新，单线程无需原子）
+    int64_t TotalFramesEncoded = 0;
+    std::chrono::steady_clock::time_point LastProgressTime;
+    double  LastProgressTimestamp = 0.0;
 
     bool bInitialized = false;
     bool bRecording   = false;
     bool bHasError    = false;
+    bool bFakeMode    = false;  // DRM 不可用时启用模拟编码（开发/测试）
 
     std::string LastError;
 };
@@ -97,21 +127,16 @@ FVAEncoder::~FVAEncoder()
 {
     StopRecording();
 
-    if (Impl->ContextId != VA_INVALID_ID)
+    if (!Impl->bFakeMode)
     {
-        vaDestroyContext(Impl->VaDisplay, Impl->ContextId);
-    }
-    if (Impl->ConfigId != VA_INVALID_ID)
-    {
-        vaDestroyConfig(Impl->VaDisplay, Impl->ConfigId);
-    }
-    if (Impl->VaDisplay)
-    {
-        vaTerminate(Impl->VaDisplay);
-    }
-    if (Impl->DrmFd >= 0)
-    {
-        close(Impl->DrmFd);
+        if (Impl->ContextId != VA_INVALID_ID)
+            vaDestroyContext(Impl->VaDisplay, Impl->ContextId);
+        if (Impl->ConfigId != VA_INVALID_ID)
+            vaDestroyConfig(Impl->VaDisplay, Impl->ConfigId);
+        if (Impl->VaDisplay)
+            vaTerminate(Impl->VaDisplay);
+        if (Impl->DrmFd >= 0)
+            close(Impl->DrmFd);
     }
 
     delete Impl;
@@ -133,18 +158,38 @@ bool FVAEncoder::Initialize(const FEncoderConfig& Config)
         return false;
     }
 
-    Impl->Width      = Config.Width;
-    Impl->Height     = Config.Height;
-    Impl->BitRate       = Config.BitRate;
-    Impl->KeyInterval   = Config.KeyframeInterval;
-    Impl->FlushInterval  = Config.FlushIntervalFrames;
+    Impl->Width        = Config.Width;
+    Impl->Height       = Config.Height;
+    Impl->FrameRate    = Config.FrameRate;
+    Impl->BitRate      = Config.BitRate;
+    Impl->KeyInterval  = Config.KeyframeInterval;
+    Impl->FlushInterval = Config.FlushIntervalFrames;
+    Impl->RecordFrameRate = Config.RecordFrameRate > 0 ? Config.RecordFrameRate : Config.FrameRate;
+    Impl->QueueSize    = Config.FrameQueueSize;
+    Impl->bContinueLastFrame = Config.bContinueLastFrame;
 
     // ---- 打开 DRM 设备 ----
     Impl->DrmFd = open("/dev/dri/renderD128", O_RDWR);
     if (Impl->DrmFd < 0)
     {
-        Impl->LastError = "无法打开 DRM 设备 /dev/dri/renderD128";
+        // 尝试备选设备
+        Impl->DrmFd = open("/dev/dri/renderD129", O_RDWR);
+    }
+    if (Impl->DrmFd < 0)
+    {
+        Impl->DrmFd = open("/dev/dri/card0", O_RDWR);
+    }
+    if (Impl->DrmFd < 0)
+    {
+#ifdef VANE_FAKE_VAAPI
+        // DRM 不可用，进入模拟编码模式（仅用于开发/测试管线逻辑）
+        Impl->bFakeMode    = true;
+        Impl->bInitialized = true;
+        return true;
+#else
+        Impl->LastError = "无法打开 DRM 设备 /dev/dri/renderD128（请确认 GPU 驱动已安装或安装 mesa-va-drivers 启用软件编码）";
         return false;
+#endif
     }
 
     // ---- 初始化 VA-API ----
@@ -188,7 +233,7 @@ bool FVAEncoder::Initialize(const FEncoderConfig& Config)
     surfAttrib.value.value.i = VA_FOURCC_NV12;
 
     vaErr = vaCreateSurfaces(Impl->VaDisplay, VA_RT_FORMAT_YUV420,
-                             Width, Height,
+                             Impl->Width, Impl->Height,
                              Impl->Surfaces, Impl->SurfaceCount,
                              &surfAttrib, 1);
     if (vaErr != VA_STATUS_SUCCESS)
@@ -199,7 +244,7 @@ bool FVAEncoder::Initialize(const FEncoderConfig& Config)
 
     // ---- 创建编码上下文 ----
     vaErr = vaCreateContext(Impl->VaDisplay, Impl->ConfigId,
-                            Width, Height, VA_PROGRESSIVE,
+                            Impl->Width, Impl->Height, VA_PROGRESSIVE,
                             Impl->Surfaces, Impl->SurfaceCount, &Impl->ContextId);
     if (vaErr != VA_STATUS_SUCCESS)
     {
@@ -224,20 +269,418 @@ bool FVAEncoder::StartRecording(const char* OutputPath)
         return false;
     }
 
-    Impl->OutputPath      = OutputPath;
-    if (!Impl->Muxer.Start(OutputPath, Impl->Width, Impl->Height))
+    // ---- 打开 MP4Muxer（fake 模式使用与码流一致的 16x16，并预注入 SPS/PPS）----
     {
-        Impl->LastError = "无法创建输出文件";
-        return false;
+        int32 muxW = Impl->bFakeMode ? 320 : Impl->Width;
+        int32 muxH = Impl->bFakeMode ? 240 : Impl->Height;
+#ifdef VANE_FAKE_VAAPI
+        if (Impl->bFakeMode)
+        {
+            // 预注入 SPS/PPS，确保 moov 中的 avcC 正确
+            // 由 x264 生成的真正可解码的 Baseline Profile CAVLC H.264
+            // 320x240 CAVLC Baseline H.264 (x264 生成，真正可解码)
+            static const uint8_t kFakeSPS[] = {
+                0x67,0x42,0xC0,0x1E,0xDC,0x14,0x1F,0xB0,0x11,0x00,0x00,0x03,
+                0x00,0x01,0x00,0x00,0x03,0x00,0x02,0x0F,0x16,0x2F,0x80
+            };
+            static const uint8_t kFakePPS[] = {
+                0x68,0xCE,0x0F,0x2C,0x80
+            };
+            Impl->Muxer.SetHeaders(kFakeSPS, sizeof(kFakeSPS),
+                                    kFakePPS, sizeof(kFakePPS));
+        }
+#endif
+        if (!Impl->Muxer.Start(OutputPath, muxW, muxH))
+        {
+            Impl->LastError = "无法创建输出文件";
+            return false;
+        }
     }
-    Impl->FrameCount      = 0;
-    Impl->bHasError       = false;
-    Impl->bRecording      = true;
+
+    Impl->OutputPath  = OutputPath;
+    Impl->bHasError   = false;
+    Impl->bRecording  = true;
+
+    // 触发状态回调
+    if (Impl->StateCb)
+        Impl->StateCb(ERecordingState_Starting, Impl->StateUserData);
+
+    // ---- 构建编码回调（在编码线程中执行 VA-API 编码）----
+    FVAEncoderImpl* pImpl = Impl;
+    FEncodeCallback encodeCb = [pImpl](const FFrameBuffer& Frame) {
+        if (pImpl->bHasError) return;
+
+        int64_t frameIdx = pImpl->EncodedCount.load(std::memory_order_relaxed);
+
+#ifdef VANE_FAKE_VAAPI
+        if (pImpl->bFakeMode)
+        {
+            // ---- x264 生成的 320×240 CAVLC Baseline 黑色帧 ----
+            bool bIsIDR = ((frameIdx % pImpl->KeyInterval) == 0);
+            static const uint8_t kStartCode[] = { 0x00, 0x00, 0x00, 0x01 };
+            static const uint8_t kFakeIDR[] = {
+                0x65,0x88,0x84,0x04,0xBC,0x98,0xA0,0x00,0x38,0xA3,0x27,0x27,0x27,0x27,0x27,0x27,
+                0x27,0x27,0x27,0x27,0x27,0x27,0x27,0x27,0x27,0x27,0x27,0x27,0x27,0x5D,0x75,0xD7,
+                0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,
+                0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,
+                0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,
+                0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,
+                0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,
+                0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,
+                0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,
+                0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,
+                0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,
+                0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,
+                0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,
+                0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,
+                0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x5D,0x75,0xD7,0x80,
+            };
+
+            std::vector<uint8_t> annexb;
+            if (bIsIDR)
+            {
+                static const uint8_t kFakeSPS[] = {
+                    0x67,0x42,0xC0,0x1E,0xDC,0x14,0x1F,0xB0,0x11,0x00,0x00,0x03,
+                    0x00,0x01,0x00,0x00,0x03,0x00,0x02,0x0F,0x16,0x2F,0x80
+                };
+                static const uint8_t kFakePPS[] = {
+                    0x68,0xCE,0x0F,0x2C,0x80
+                };
+                annexb.insert(annexb.end(), kStartCode, kStartCode + 4);
+                annexb.insert(annexb.end(), kFakeSPS, kFakeSPS + sizeof(kFakeSPS));
+                annexb.insert(annexb.end(), kStartCode, kStartCode + 4);
+                annexb.insert(annexb.end(), kFakePPS, kFakePPS + sizeof(kFakePPS));
+                annexb.insert(annexb.end(), kStartCode, kStartCode + 4);
+                annexb.insert(annexb.end(), kFakeIDR, kFakeIDR + sizeof(kFakeIDR));
+            }
+            else
+            {
+                annexb.insert(annexb.end(), kStartCode, kStartCode + 4);
+                annexb.insert(annexb.end(), kFakeIDR, kFakeIDR + sizeof(kFakeIDR));
+            }
+
+            pImpl->Muxer.AddFrame(annexb.data(), annexb.size(), bIsIDR);
+
+            pImpl->EncodedCount.fetch_add(1, std::memory_order_relaxed);
+            ++pImpl->TotalFramesEncoded;
+
+            // ---- 进度回调（每秒一次）----
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - pImpl->LastProgressTime).count();
+            if (elapsed >= 1000 && pImpl->ProgressCb)
+            {
+                pImpl->ProgressCb(pImpl->TotalFramesEncoded, 0,
+                                  Frame.TimestampSeconds, pImpl->ProgressUserData);
+                pImpl->LastProgressTime = now;
+            }
+            pImpl->LastProgressTimestamp = Frame.TimestampSeconds;
+
+            // ---- fMP4 周期刷盘 ----
+            if (pImpl->FlushInterval > 0 && (pImpl->TotalFramesEncoded % pImpl->FlushInterval == 0))
+                pImpl->Muxer.FlushFragment();
+
+            return;
+        }
+#endif
+
+        VAStatus vaErr;
+
+        // 选择当前 surface（轮转）
+        int32 surfIdx = frameIdx % pImpl->SurfaceCount;
+        VASurfaceID surface = pImpl->Surfaces[surfIdx];
+
+        // ---- BGRA → NV12 转换并写入 VA surface ----
+        VAImage surfaceImg;
+        memset(&surfaceImg, 0, sizeof(surfaceImg));
+        vaErr = vaDeriveImage(pImpl->VaDisplay, surface, &surfaceImg);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            VAImageFormat format;
+            memset(&format, 0, sizeof(format));
+            format.fourcc         = VA_FOURCC_NV12;
+            format.byte_order     = VA_LSB_FIRST;
+            format.bits_per_pixel = 12;
+
+            vaErr = vaCreateImage(pImpl->VaDisplay, &format,
+                                  pImpl->Width, pImpl->Height, &surfaceImg);
+            if (vaErr != VA_STATUS_SUCCESS)
+            {
+                pImpl->bHasError = true;
+                pImpl->LastError = "创建 VA 图像失败（VAStatus=" + std::to_string(vaErr) + ")";
+                if (pImpl->ErrorCb)
+                    pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+                return;
+            }
+        }
+
+        void* imgData = nullptr;
+        vaErr = vaMapBuffer(pImpl->VaDisplay, surfaceImg.buf, &imgData);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaDestroyImage(pImpl->VaDisplay, surfaceImg.image_id);
+            pImpl->bHasError = true;
+            pImpl->LastError = "vaMapBuffer（surface 图像）失败";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+
+        uint8* yPlane  = static_cast<uint8*>(imgData) + surfaceImg.offsets[0];
+        uint8* uvPlane = static_cast<uint8*>(imgData) + surfaceImg.offsets[1];
+        ConvertBGRAToNV12(Frame.Data, pImpl->Width, pImpl->Height,
+                          yPlane, uvPlane,
+                          surfaceImg.pitches[0], surfaceImg.pitches[1]);
+
+        vaUnmapBuffer(pImpl->VaDisplay, surfaceImg.buf);
+        vaDestroyImage(pImpl->VaDisplay, surfaceImg.image_id);
+
+        // ---- 开始编码帧 ----
+        vaErr = vaBeginPicture(pImpl->VaDisplay, pImpl->ContextId, surface);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaEndPicture(pImpl->VaDisplay, pImpl->ContextId);
+            pImpl->bHasError = true;
+            pImpl->LastError = "vaBeginPicture 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+
+        // ---- 序列参数集 ----
+        int32 alignedWidth  = ((pImpl->Width  + 15) / 16) * 16;
+        int32 alignedHeight = ((pImpl->Height + 15) / 16) * 16;
+
+        VAEncSequenceParameterBufferH264 seqParam = {};
+        seqParam.level_idc        = 42;
+        seqParam.picture_width_in_mbs  = alignedWidth  / 16;
+        seqParam.picture_height_in_mbs = alignedHeight / 16;
+        seqParam.bits_per_second       = pImpl->BitRate;
+        seqParam.intra_period          = pImpl->KeyInterval;
+        seqParam.intra_idr_period      = pImpl->KeyInterval;
+        seqParam.ip_period             = 1;
+        seqParam.max_num_ref_frames    = 1;
+        seqParam.seq_fields.bits.chroma_format_idc                 = 1;
+        seqParam.seq_fields.bits.frame_mbs_only_flag               = 1;
+        seqParam.seq_fields.bits.log2_max_frame_num_minus4         = 0;
+        seqParam.seq_fields.bits.pic_order_cnt_type                = 0;
+        seqParam.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 0;
+
+        VABufferID seqBuf;
+        vaErr = vaCreateBuffer(pImpl->VaDisplay, pImpl->ContextId,
+                               VAEncSequenceParameterBufferType,
+                               sizeof(seqParam), 1, &seqParam, &seqBuf);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaEndPicture(pImpl->VaDisplay, pImpl->ContextId);
+            pImpl->bHasError = true;
+            pImpl->LastError = "创建序列参数 buffer 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+        vaRenderPicture(pImpl->VaDisplay, pImpl->ContextId, &seqBuf, 1);
+        vaDestroyBuffer(pImpl->VaDisplay, seqBuf);
+
+        // ---- 编码输出缓冲区 ----
+        VABufferID codedBuf = VA_INVALID_ID;
+        vaErr = vaCreateBuffer(pImpl->VaDisplay, pImpl->ContextId,
+                               VAEncCodedBufferType,
+                               pImpl->Width * pImpl->Height * 3, 1, nullptr, &codedBuf);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaEndPicture(pImpl->VaDisplay, pImpl->ContextId);
+            pImpl->bHasError = true;
+            pImpl->LastError = "创建编码输出 buffer 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+
+        // ---- 图像参数集 ----
+        bool bIsIDR = ((frameIdx % pImpl->KeyInterval) == 0);
+
+        VAEncPictureParameterBufferH264 picParam = {};
+        picParam.CurrPic.picture_id = surface;
+        picParam.CurrPic.flags      = 0;
+        picParam.coded_buf          = codedBuf;
+        picParam.last_picture       = 0;
+        picParam.pic_init_qp        = 26;
+        for (int32 i = 0; i < 16; ++i)
+            picParam.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+        picParam.num_ref_idx_l0_active_minus1 = 0;
+        picParam.num_ref_idx_l1_active_minus1 = 0;
+        picParam.pic_fields.bits.idr_pic_flag       = bIsIDR ? 1 : 0;
+        picParam.pic_fields.bits.reference_pic_flag = 1;
+        picParam.pic_fields.bits.entropy_coding_mode_flag = 1;
+        picParam.pic_fields.bits.deblocking_filter_control_present_flag = 1;
+
+        VABufferID picBuf;
+        vaErr = vaCreateBuffer(pImpl->VaDisplay, pImpl->ContextId,
+                               VAEncPictureParameterBufferType,
+                               sizeof(picParam), 1, &picParam, &picBuf);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaDestroyBuffer(pImpl->VaDisplay, codedBuf);
+            vaEndPicture(pImpl->VaDisplay, pImpl->ContextId);
+            pImpl->bHasError = true;
+            pImpl->LastError = "创建图像参数 buffer 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+        vaRenderPicture(pImpl->VaDisplay, pImpl->ContextId, &picBuf, 1);
+        vaDestroyBuffer(pImpl->VaDisplay, picBuf);
+
+        // ---- Slice 参数 ----
+        VAEncSliceParameterBufferH264 sliceParam = {};
+        sliceParam.macroblock_address = 0;
+        sliceParam.num_macroblocks    = (alignedWidth / 16) * (alignedHeight / 16);
+        sliceParam.slice_type         = bIsIDR ? 2 : 0;
+        sliceParam.slice_alpha_c0_offset_div2 = 0;
+        sliceParam.slice_beta_offset_div2      = 0;
+        sliceParam.direct_spatial_mv_pred_flag = 1;
+
+        VABufferID sliceBuf;
+        vaErr = vaCreateBuffer(pImpl->VaDisplay, pImpl->ContextId,
+                               VAEncSliceParameterBufferType,
+                               sizeof(sliceParam), 1, &sliceParam, &sliceBuf);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaDestroyBuffer(pImpl->VaDisplay, codedBuf);
+            vaEndPicture(pImpl->VaDisplay, pImpl->ContextId);
+            pImpl->bHasError = true;
+            pImpl->LastError = "创建 Slice 参数 buffer 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+        vaRenderPicture(pImpl->VaDisplay, pImpl->ContextId, &sliceBuf, 1);
+        vaDestroyBuffer(pImpl->VaDisplay, sliceBuf);
+
+        // ---- 码率控制参数 ----
+        VAEncMiscParameterRateControl rateCtrl = {};
+        rateCtrl.bits_per_second = (unsigned int)pImpl->BitRate;
+        rateCtrl.target_percentage = 70;
+        rateCtrl.quality_factor    = 26;
+        rateCtrl.rc_flags.bits.reset = 0;
+        rateCtrl.rc_flags.bits.disable_frame_skip = 1;
+
+        size_t miscSize = sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl);
+        std::vector<uint8_t> miscData(miscSize);
+        auto* miscBufHeader = reinterpret_cast<VAEncMiscParameterBuffer*>(miscData.data());
+        miscBufHeader->type = VAEncMiscParameterTypeRateControl;
+        memcpy(miscBufHeader->data, &rateCtrl, sizeof(rateCtrl));
+
+        VABufferID miscBuf;
+        vaErr = vaCreateBuffer(pImpl->VaDisplay, pImpl->ContextId,
+                               VAEncMiscParameterBufferType,
+                               miscSize, 1, miscData.data(), &miscBuf);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaDestroyBuffer(pImpl->VaDisplay, codedBuf);
+            vaEndPicture(pImpl->VaDisplay, pImpl->ContextId);
+            pImpl->bHasError = true;
+            pImpl->LastError = "创建码率控制参数 buffer 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+        vaRenderPicture(pImpl->VaDisplay, pImpl->ContextId, &miscBuf, 1);
+        vaDestroyBuffer(pImpl->VaDisplay, miscBuf);
+
+        // ---- 提交编码 ----
+        vaErr = vaEndPicture(pImpl->VaDisplay, pImpl->ContextId);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaDestroyBuffer(pImpl->VaDisplay, codedBuf);
+            pImpl->bHasError = true;
+            pImpl->LastError = "vaEndPicture 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+
+        // ---- 等待编码完成 ----
+        vaErr = vaSyncSurface(pImpl->VaDisplay, surface);
+        if (vaErr != VA_STATUS_SUCCESS)
+        {
+            vaDestroyBuffer(pImpl->VaDisplay, codedBuf);
+            pImpl->bHasError = true;
+            pImpl->LastError = "vaSyncSurface 失败（VAStatus=" + std::to_string(vaErr) + ")";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+
+        // ---- 获取编码数据并送入 MP4 复用器 ----
+        VACodedBufferSegment* codedSeg = nullptr;
+        vaErr = vaMapBuffer(pImpl->VaDisplay, codedBuf, (void**)&codedSeg);
+        if (vaErr != VA_STATUS_SUCCESS || !codedSeg)
+        {
+            vaDestroyBuffer(pImpl->VaDisplay, codedBuf);
+            pImpl->bHasError = true;
+            pImpl->LastError = "vaMapBuffer（编码数据）失败";
+            if (pImpl->ErrorCb)
+                pImpl->ErrorCb(EErrorLevel_Error, pImpl->LastError.c_str(), pImpl->ErrorUserData);
+            return;
+        }
+
+        if (codedSeg->size > 0)
+            pImpl->Muxer.AddFrame(static_cast<const uint8_t*>(codedSeg->buf), codedSeg->size, bIsIDR);
+
+        vaUnmapBuffer(pImpl->VaDisplay, codedBuf);
+        vaDestroyBuffer(pImpl->VaDisplay, codedBuf);
+
+        // 更新编码线程帧计数
+        pImpl->EncodedCount.fetch_add(1, std::memory_order_relaxed);
+
+        // ---- 进度回调（每秒一次）----
+        ++pImpl->TotalFramesEncoded;
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - pImpl->LastProgressTime).count();
+
+        if (elapsed >= 1000 && pImpl->ProgressCb)
+        {
+            pImpl->ProgressCb(pImpl->TotalFramesEncoded, 0,
+                              Frame.TimestampSeconds, pImpl->ProgressUserData);
+            pImpl->LastProgressTime = now;
+        }
+        pImpl->LastProgressTimestamp = Frame.TimestampSeconds;
+
+        // ---- fMP4 周期刷盘 ----
+        if (pImpl->FlushInterval > 0 && (pImpl->TotalFramesEncoded % pImpl->FlushInterval == 0))
+            pImpl->Muxer.FlushFragment();
+
+        // 测试用编码延迟注入
+        #ifdef VANE_TEST_ENCODING_DELAY_MS
+            std::this_thread::sleep_for(std::chrono::milliseconds(VANE_TEST_ENCODING_DELAY_MS));
+        #endif
+    };
+
+    // ---- 刷盘回调（编码线程触发）----
+    FFlushCallback flushCb = [pImpl]() {
+        pImpl->Muxer.FlushFragment();
+    };
+
+    // ---- 启动异步编码管线 ----
+    Impl->Pipeline.Start(std::move(encodeCb), std::move(flushCb),
+                         Impl->QueueSize, Impl->FlushInterval,
+                         Impl->bContinueLastFrame, Impl->FrameRate);
+
+    // 初始化进度统计
+    Impl->TotalFramesEncoded = 0;
+    Impl->LastProgressTime   = std::chrono::steady_clock::now();
+    Impl->LastProgressTimestamp = 0.0;
+
+    if (Impl->StateCb)
+        Impl->StateCb(ERecordingState_Recording, Impl->StateUserData);
 
     return true;
 }
 
-bool FVAEncoder::EncodeFrame(const uint8* RawBGRA, int32 DataSize, double /*TimestampSeconds*/)
+bool FVAEncoder::EncodeFrame(const uint8* RawBGRA, int32 DataSize, double TimestampSeconds)
 {
     if (!Impl->bRecording)
     {
@@ -250,234 +693,46 @@ bool FVAEncoder::EncodeFrame(const uint8* RawBGRA, int32 DataSize, double /*Time
         return false;
     }
 
-    VAStatus vaErr;
+    // ---- 推入异步队列 ----
+    Impl->Pipeline.PushFrame(RawBGRA, DataSize, TimestampSeconds, Impl->RecordFrameRate);
 
-    // ---- 从 Surface 池中选择一个空闲 surface ----
-    int32 surfIdx = Impl->FrameCount % Impl->SurfaceCount;
-    VASurfaceID surface = Impl->Surfaces[surfIdx];
-
-    // ---- 将 BGRA 数据转换为 NV12 并写入 surface ----
-    VAImage surfaceImg;
-    vaErr = vaDeriveImage(Impl->VaDisplay, surface, &surfaceImg);
-    if (vaErr != VA_STATUS_SUCCESS)
+    int32 dropped = static_cast<int32>(Impl->Pipeline.GetDroppedFrames());
+    if (dropped > Impl->LastDroppedCount)
     {
-        // 如果 vaDeriveImage 不支持，尝试用 vaCreateImage + vaPutImage
-        vaErr = vaCreateImage(Impl->VaDisplay, &surfaceImg, VA_FOURCC_NV12,
-                              Impl->Width, Impl->Height);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-        Impl->bHasError = true;
-        Impl->LastError = "创建序列参数 buffer 失败";
-        return false;
+        Impl->LastDroppedCount = dropped;
+        if (Impl->FrameDropCb)
+            Impl->FrameDropCb(dropped, Impl->FrameDropUserData);
     }
-    }
-
-    void* imgData = nullptr;
-    vaErr = vaMapBuffer(Impl->VaDisplay, surfaceImg.buf, &imgData);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaDestroyImage(Impl->VaDisplay, surfaceImg.image_id);
-        Impl->bHasError = true;
-        Impl->LastError = "vaMapBuffer（surface 图像）失败";
-        return false;
-    }
-
-    uint8* yPlane  = static_cast<uint8*>(imgData) + surfaceImg.offsets[0];
-    uint8* uvPlane = static_cast<uint8*>(imgData) + surfaceImg.offsets[1];
-    ConvertBGRAToNV12(RawBGRA, Impl->Width, Impl->Height,
-                      yPlane, uvPlane,
-                      surfaceImg.pitches[0], surfaceImg.pitches[1]);
-
-    vaUnmapBuffer(Impl->VaDisplay, surfaceImg.buf);
-    vaDestroyImage(Impl->VaDisplay, surfaceImg.image_id);
-
-    // ---- 开始编码帧 ----
-    vaErr = vaBeginPicture(Impl->VaDisplay, Impl->ContextId, surface);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-        Impl->bHasError = true;
-        Impl->LastError = "创建编码输出 buffer 失败";
-        return false;
-    }
-
-    // ---- 构造编码参数 ----
-    int32 alignedWidth  = ((Impl->Width  + 15) / 16) * 16;
-    int32 alignedHeight = ((Impl->Height + 15) / 16) * 16;
-
-    // 序列参数集
-    VAEncSequenceParameterBufferH264 seqParam = {};
-    seqParam.level_idc        = 42;   // Level 4.2（支持 1080p）
-    seqParam.picture_width_in_mbs  = alignedWidth  / 16;
-    seqParam.picture_height_in_mbs = alignedHeight / 16;
-    seqParam.bits_per_second       = Impl->BitRate;
-    seqParam.intra_period          = Impl->KeyInterval;  // I 帧间隔
-    seqParam.intra_idr_period      = Impl->KeyInterval;
-    seqParam.ip_period             = 1;   // IPPPPP...
-    seqParam.max_num_ref_frames    = 1;
-    seqParam.seq_fields.bits.chroma_format_idc                 = 1;
-    seqParam.seq_fields.bits.frame_mbs_only_flag               = 1;
-    seqParam.seq_fields.bits.log2_max_frame_num_minus4         = 0;
-    seqParam.seq_fields.bits.pic_order_cnt_type                = 0;
-    seqParam.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = 0;
-
-    VABufferID seqBuf;
-    vaErr = vaCreateBuffer(Impl->VaDisplay, Impl->ContextId,
-                           VAEncSequenceParameterBufferType,
-                           sizeof(seqParam), 1, &seqParam, &seqBuf);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-        Impl->bHasError = true;
-        return false;
-    }
-    vaRenderPicture(Impl->VaDisplay, Impl->ContextId, &seqBuf, 1);
-    vaDestroyBuffer(Impl->VaDisplay, seqBuf);
-
-    // ---- 创建编码输出缓冲区 ----
-    // 缓冲区大小按最坏情况（原始帧大小）
-    VABufferID codedBuf = VA_INVALID_ID;
-    vaErr = vaCreateBuffer(Impl->VaDisplay, Impl->ContextId,
-                           VAEncCodedBufferType,
-                            Impl->Width * Impl->Height * 3, 1, nullptr, &codedBuf);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-        Impl->bHasError = true;
-        Impl->LastError = "创建编码输出 buffer 失败";
-        return false;
-    }
-
-    // 图像参数集
-    bool bIsIDR = ((Impl->FrameCount % Impl->KeyInterval) == 0);
-
-    VAEncPictureParameterBufferH264 picParam = {};
-    picParam.picture_width  = Impl->Width;
-    picParam.picture_height = Impl->Height;
-    picParam.reconstructed_picture = surface;
-    picParam.coded_buf     = codedBuf;
-    picParam.last_picture  = VA_INVALID_ID;
-    picParam.pic_init_qp   = 26;
-    picParam.ref_pic_list0[0] = VA_INVALID_SURFACE;
-    picParam.ref_pic_list1[0] = VA_INVALID_SURFACE;
-    picParam.pic_fields.bits.idr_pic_flag       = bIsIDR ? 1 : 0;
-    picParam.pic_fields.bits.reference_pic_flag = 1;
-    picParam.pic_fields.bits.entropy_coding_mode_flag = 1;
-    picParam.pic_fields.bits.deblocking_filter_control_present_flag = 1;
-
-    VABufferID picBuf;
-    vaErr = vaCreateBuffer(Impl->VaDisplay, Impl->ContextId,
-                           VAEncPictureParameterBufferType,
-                            sizeof(picParam), 1, &picParam, &picBuf);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaDestroyBuffer(Impl->VaDisplay, codedBuf);
-        vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-        Impl->bHasError = true;
-        Impl->LastError = "创建图像参数 buffer 失败";
-        return false;
-    }
-    vaRenderPicture(Impl->VaDisplay, Impl->ContextId, &picBuf, 1);
-    vaDestroyBuffer(Impl->VaDisplay, picBuf);
-
-    // Slice 参数
-    VAEncSliceParameterBufferH264 sliceParam = {};
-    sliceParam.macroblock_address = 0;
-    sliceParam.num_macroblocks    = (alignedWidth / 16) * (alignedHeight / 16);
-    sliceParam.slice_type         = bIsIDR ? 2 : 0; // I or P
-    sliceParam.slice_alpha_c0_offset_div2 = 0;
-    sliceParam.slice_beta_offset_div2      = 0;
-    sliceParam.direct_spatial_mv_pred_flag = 1;
-
-    VABufferID sliceBuf;
-    vaErr = vaCreateBuffer(Impl->VaDisplay, Impl->ContextId,
-                           VAEncSliceParameterBufferType,
-                            sizeof(sliceParam), 1, &sliceParam, &sliceBuf);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaDestroyBuffer(Impl->VaDisplay, codedBuf);
-        vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-        Impl->bHasError = true;
-        Impl->LastError = "创建 Slice 参数 buffer 失败";
-        return false;
-    }
-    vaRenderPicture(Impl->VaDisplay, Impl->ContextId, &sliceBuf, 1);
-    vaDestroyBuffer(Impl->VaDisplay, sliceBuf);
-
-    // 码率控制参数
-    VAEncMiscParameterRateControl rateCtrl = {};
-    rateCtrl.bits_per_second = Impl->BitRate;
-    rateCtrl.target_percentage = 70;
-    rateCtrl.quality_factor    = 26;
-    rateCtrl.rc_flags.bits.reset = 0;
-    rateCtrl.rc_flags.bits.disable_frame_skip = 1;
-
-    VAEncMiscParameterBuffer miscParam = {};
-    miscParam.type = VAEncMiscParameterTypeRateControl;
-    memcpy(miscParam.data, &rateCtrl, sizeof(rateCtrl));
-
-    VABufferID miscBuf;
-    vaErr = vaCreateBuffer(Impl->VaDisplay, Impl->ContextId,
-                           VAEncMiscParameterBufferType,
-                           sizeof(miscParam), 1, &miscParam, &miscBuf);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaDestroyBuffer(Impl->VaDisplay, codedBuf);
-        vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-        Impl->bHasError = true;
-        Impl->LastError = "创建码率控制参数 buffer 失败";
-        return false;
-    }
-    vaRenderPicture(Impl->VaDisplay, Impl->ContextId, &miscBuf, 1);
-    vaDestroyBuffer(Impl->VaDisplay, miscBuf);
-
-    // ---- 提交编码 ----
-    vaErr = vaEndPicture(Impl->VaDisplay, Impl->ContextId);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaDestroyBuffer(Impl->VaDisplay, codedBuf);
-        Impl->bHasError = true;
-        Impl->LastError = "vaEndPicture 失败";
-        return false;
-    }
-
-    // ---- 等待编码完成 ----
-    vaErr = vaSyncSurface(Impl->VaDisplay, surface);
-    if (vaErr != VA_STATUS_SUCCESS)
-    {
-        vaDestroyBuffer(Impl->VaDisplay, codedBuf);
-        Impl->bHasError = true;
-        Impl->LastError = "vaSyncSurface 失败";
-        return false;
-    }
-
-    // ---- 获取编码数据并送入 MP4 复用器 ----
-    VACodedBufferSegment* codedSeg = nullptr;
-    vaErr = vaMapBuffer(Impl->VaDisplay, codedBuf, (void**)&codedSeg);
-    if (vaErr != VA_STATUS_SUCCESS || !codedSeg)
-    {
-        vaDestroyBuffer(Impl->VaDisplay, codedBuf);
-        Impl->bHasError = true;
-        Impl->LastError = "vaMapBuffer（编码数据）失败";
-        return false;
-    }
-
-    if (codedSeg->size > 0)
-    {
-        Impl->Muxer.AddFrame(codedSeg->buf, codedSeg->size, bIsIDR);
-    }
-
-    vaUnmapBuffer(Impl->VaDisplay, codedBuf);
-    vaDestroyBuffer(Impl->VaDisplay, codedBuf);
-
-    ++Impl->FrameCount;
-
-    // fMP4 周期刷盘
-    if (Impl->FlushInterval > 0 && (Impl->FrameCount % Impl->FlushInterval == 0))
-        Impl->Muxer.FlushFragment();
 
     return true;
+}
+
+void FVAEncoder::RequestStop()
+{
+    if (!Impl->bRecording) return;
+
+    Impl->bRecording = false;
+
+    if (Impl->StateCb)
+        Impl->StateCb(ERecordingState_Stopping, Impl->StateUserData);
+
+    FVAEncoderImpl* pImpl = Impl;
+    FFinalizeCallback finalizeCb = [pImpl]() {
+        // 完成 MP4 文件写入
+        pImpl->Muxer.Finish();
+
+        // 强制最终进度
+        if (pImpl->ProgressCb && pImpl->TotalFramesEncoded > 0)
+        {
+            pImpl->ProgressCb(pImpl->TotalFramesEncoded, 0,
+                              pImpl->LastProgressTimestamp, pImpl->ProgressUserData);
+        }
+
+        if (pImpl->StateCb)
+            pImpl->StateCb(ERecordingState_Idle, pImpl->StateUserData);
+    };
+
+    Impl->Pipeline.RequestStop(std::move(finalizeCb));
 }
 
 void FVAEncoder::StopRecording()
@@ -486,16 +741,24 @@ void FVAEncoder::StopRecording()
 
     Impl->bRecording = false;
 
-    if (Impl->Muxer.GetFrameCount() > 0)
-    {
-        Impl->Muxer.Finish();
-    }
-}
+    if (Impl->StateCb)
+        Impl->StateCb(ERecordingState_Stopping, Impl->StateUserData);
 
-void FVAEncoder::RequestStop()
-{
-    // TODO: 实现异步停止（当前委托同步版本）
-    StopRecording();
+    // 同步停止：等待编码线程排空后收尾
+    Impl->Pipeline.Stop();
+
+    // 完成 MP4 文件写入
+    Impl->Muxer.Finish();
+
+    // 强制最终进度
+    if (Impl->ProgressCb && Impl->TotalFramesEncoded > 0)
+    {
+        Impl->ProgressCb(Impl->TotalFramesEncoded, 0,
+                         Impl->LastProgressTimestamp, Impl->ProgressUserData);
+    }
+
+    if (Impl->StateCb)
+        Impl->StateCb(ERecordingState_Idle, Impl->StateUserData);
 }
 
 bool FVAEncoder::IsRecording() const
@@ -519,5 +782,26 @@ FEncoderCapability FVAEncoder::CheckCapability() const
     return cap;
 }
 
-// TODO: 实现回调通知（SetStateCallback / SetErrorCallback / SetProgressCallback / SetFrameDropCallback）
-// 当前使用 IVideoEncoder 基类默认空实现，后续需要覆盖并在适当位置触发回调。
+void FVAEncoder::SetStateCallback(VaneStateCallback Cb, void* UserData)
+{
+    Impl->StateCb     = Cb;
+    Impl->StateUserData = UserData;
+}
+
+void FVAEncoder::SetErrorCallback(VaneErrorCallback Cb, void* UserData)
+{
+    Impl->ErrorCb     = Cb;
+    Impl->ErrorUserData = UserData;
+}
+
+void FVAEncoder::SetProgressCallback(VaneProgressCallback Cb, void* UserData)
+{
+    Impl->ProgressCb     = Cb;
+    Impl->ProgressUserData = UserData;
+}
+
+void FVAEncoder::SetFrameDropCallback(VaneFrameDropCallback Cb, void* UserData)
+{
+    Impl->FrameDropCb     = Cb;
+    Impl->FrameDropUserData = UserData;
+}

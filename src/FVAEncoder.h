@@ -5,7 +5,7 @@
 // 前向声明，隐藏平台相关实现细节（PIMPL 模式）
 struct FVAEncoderImpl;
 
-// Linux VA-API 硬件编码器封装（输出 H.264 裸流）
+// Linux VA-API 硬件编码器封装（输出 H.264 裸流，内置 MP4Muxer 封装为 fMP4）
 class FVAEncoder : public IVideoEncoder
 {
 public:
@@ -19,6 +19,12 @@ public:
     void RequestStop() override;
     bool IsRecording() const override;
     const char* GetLastError() const override;
+    FEncoderCapability CheckCapability() const override;
+
+    void SetStateCallback(VaneStateCallback Cb, void* UserData) override;
+    void SetErrorCallback(VaneErrorCallback Cb, void* UserData) override;
+    void SetProgressCallback(VaneProgressCallback Cb, void* UserData) override;
+    void SetFrameDropCallback(VaneFrameDropCallback Cb, void* UserData) override;
 
 private:
     FVAEncoderImpl* Impl;

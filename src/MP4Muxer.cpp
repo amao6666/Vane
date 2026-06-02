@@ -14,27 +14,41 @@ MP4Muxer::~MP4Muxer()
 }
 
 // ============================================================================
-// 开始录制：打开文件 → ftyp → moov(mvex)
+// 开始录制：打开文件 → ftyp
 // ============================================================================
 
-bool MP4Muxer::Start(const char* OutputPath, int32 InWidth, int32 InHeight)
+bool MP4Muxer::Start(const char* OutputPath, int32_t InWidth, int32_t InHeight)
 {
     Width  = InWidth;
     Height = InHeight;
     TotalFrames = 0;
-    FragmentSequence = 0;
-    bHeadersExtracted = false;
-    SPS.clear();
-    PPS.clear();
     PendingFrames.clear();
+    AllFrames.clear();
+    // 如果已通过 SetHeaders() 预注入 SPS/PPS，则保留
+    if (!bHeadersExtracted)
+    {
+        SPS.clear();
+        PPS.clear();
+    }
 
     OutputFile = fopen(OutputPath, "wb");
     if (!OutputFile) return false;
 
     WriteFtyp();
-    WriteMoov();
     fflush(OutputFile);
     return true;
+}
+
+// ============================================================================
+// 预注入 SPS/PPS
+// ============================================================================
+
+void MP4Muxer::SetHeaders(const uint8_t* SpsData, size_t SpsLen,
+                           const uint8_t* PpsData, size_t PpsLen)
+{
+    bHeadersExtracted = true;
+    SPS.assign(SpsData, SpsData + SpsLen);
+    PPS.assign(PpsData, PpsData + PpsLen);
 }
 
 // ============================================================================
@@ -51,29 +65,37 @@ void MP4Muxer::AddFrame(const uint8_t* AnnexBData, size_t Size, bool bIsKeyFrame
 }
 
 // ============================================================================
-// 刷写 fragment
+// 刷写缓冲区（仅 fflush，不写 box；WriteMdat 在 Finish 统一写入）
 // ============================================================================
 
 void MP4Muxer::FlushFragment()
 {
     if (PendingFrames.empty()) return;
-    WriteMoofAndMdat();
+    // 将当前累积帧移入全局列表，不写磁盘
+    AllFrames.insert(AllFrames.end(),
+                     std::make_move_iterator(PendingFrames.begin()),
+                     std::make_move_iterator(PendingFrames.end()));
     PendingFrames.clear();
     fflush(OutputFile);
 }
 
 // ============================================================================
-// 完成
+// 完成：写入 mdat + moov（标准 MP4，moov 在末尾）
 // ============================================================================
 
 bool MP4Muxer::Finish()
 {
-    FlushFragment();
-    if (OutputFile)
-    {
-        fclose(OutputFile);
-        OutputFile = nullptr;
-    }
+    FlushFragment();  // 确保 PendingFrames 归入 AllFrames
+    if (!OutputFile) return true;
+
+    // 写 mdat
+    WriteMdat();
+
+    // 写 moov（含完整 stts/stsz/stsc/stco/stss 表）
+    WriteMoov();
+    fflush(OutputFile);
+    fclose(OutputFile);
+    OutputFile = nullptr;
     return true;
 }
 
@@ -103,7 +125,16 @@ void MP4Muxer::ExtractHeaders(const uint8_t* Data, size_t Size)
         size_t scEnd = FindStartCode(Data, pos, Size);
         if (scEnd == pos) { pos = FindStartCode(Data, pos + 1, Size); continue; }
         size_t naluStart = scEnd;
-        size_t naluEnd   = FindStartCode(Data, naluStart, Size);
+        size_t naluAfter  = FindStartCode(Data, naluStart, Size);
+        // 回退 start code 长度，得到实际 NAL 数据末尾
+        size_t naluEnd = naluAfter;
+        if (naluEnd >= 4 && Data[naluEnd-4]==0x00 && Data[naluEnd-3]==0x00
+            && Data[naluEnd-2]==0x00 && Data[naluEnd-1]==0x01)
+            naluEnd -= 4;
+        else if (naluEnd >= 3 && Data[naluEnd-3]==0x00 && Data[naluEnd-2]==0x00
+                 && Data[naluEnd-1]==0x01)
+            naluEnd -= 3;
+
         if (naluStart < naluEnd && naluStart < Size)
         {
             uint8_t type = Data[naluStart] & 0x1F;
@@ -111,7 +142,7 @@ void MP4Muxer::ExtractHeaders(const uint8_t* Data, size_t Size)
             if (type == 7) SPS.assign(Data + naluStart, Data + naluStart + len);
             if (type == 8) PPS.assign(Data + naluStart, Data + naluStart + len);
         }
-        pos = naluEnd;
+        pos = naluEnd;  // 回退到下一个 start code 开头
     }
 }
 
@@ -129,14 +160,23 @@ void MP4Muxer::ConvertAndCacheFrame(const uint8_t* Data, size_t Size, bool bIsKe
         size_t scEnd = FindStartCode(Data, pos, Size);
         if (scEnd == pos) { pos = FindStartCode(Data, pos + 1, Size); continue; }
         size_t naluStart = scEnd;
-        size_t naluEnd   = FindStartCode(Data, naluStart, Size);
+        size_t naluAfter  = FindStartCode(Data, naluStart, Size);
+        // 回退 start code
+        size_t naluEnd = naluAfter;
+        if (naluEnd >= 4 && Data[naluEnd-4]==0x00 && Data[naluEnd-3]==0x00
+            && Data[naluEnd-2]==0x00 && Data[naluEnd-1]==0x01)
+            naluEnd -= 4;
+        else if (naluEnd >= 3 && Data[naluEnd-3]==0x00 && Data[naluEnd-2]==0x00
+                 && Data[naluEnd-1]==0x01)
+            naluEnd -= 3;
+
         if (naluStart >= naluEnd || naluStart >= Size) break;
 
         uint8_t type = Data[naluStart] & 0x1F;
         size_t len = naluEnd - naluStart;
 
-        // SPS/PPS/AUD/SEI 不放入 mdat
-        if (type == 7 || type == 8 || type == 9 || type == 6) { pos = naluEnd; continue; }
+        // AUD/SEI 不放入 mdat
+        if (type == 9 || type == 6) { pos = naluEnd; continue; }
 
         WriteU32(avc1, (uint32_t)len);
         WriteBytes(avc1, Data + naluStart, len);
@@ -173,7 +213,6 @@ void MP4Muxer::WriteZero(std::vector<uint8_t>& Buf, size_t Len) {
     Buf.resize(Buf.size()+Len, 0);
 }
 
-// ---- fwrite 快捷 ----
 static void FWrite(const std::vector<uint8_t>& Buf, FILE* f) {
     fwrite(Buf.data(), 1, Buf.size(), f);
 }
@@ -195,270 +234,220 @@ void MP4Muxer::WriteFtyp()
 }
 
 // ============================================================================
-// moov box（fMP4 版本：含 mvex，不含 stts/stsz/stsc/stco）
+// mdat：一次性写入所有帧
+// ============================================================================
+
+void MP4Muxer::WriteMdat()
+{
+    // 计算 mdat 数据总大小
+    uint32_t dataSize = 0;
+    for (auto& f : AllFrames)
+        dataSize += (uint32_t)f.Avc1Data.size();
+
+    std::vector<uint8_t> buf;
+    WriteU32(buf, 8 + dataSize);
+    WriteFourCC(buf, "mdat");
+    FWrite(buf, OutputFile);
+
+    // 逐帧写入
+    for (auto& f : AllFrames)
+        FWrite(f.Avc1Data, OutputFile);
+}
+
+// ============================================================================
+// moov box（标准 MP4：含 stts/stsz/stsc/stco/stss）
 // ============================================================================
 
 void MP4Muxer::WriteMoov()
 {
+    uint32_t N = (uint32_t)AllFrames.size();
+
+    // 统计关键帧索引
+    std::vector<uint32_t> syncSamples;
+    for (uint32_t i = 0; i < N; ++i)
+        if (AllFrames[i].bKeyFrame) syncSamples.push_back(i + 1);
+
+    // ≤- tkhd ---
     std::vector<uint8_t> trakBuf;
+    WriteU32(trakBuf, 92); WriteFourCC(trakBuf, "tkhd");
+    WriteU32(trakBuf, 0x00000007);
+    WriteU32(trakBuf, 0); WriteU32(trakBuf, 0);
+    WriteU32(trakBuf, TrackID); WriteU32(trakBuf, 0);
+    WriteU32(trakBuf, N * FrameDuration);
+    WriteZero(trakBuf, 8);
+    WriteU16(trakBuf, 0); WriteU16(trakBuf, 0);
+    WriteU16(trakBuf, 0x0100); WriteU16(trakBuf, 0);
+    // matrix: 9 × 4 = 36 bytes (identity)
+    WriteU32(trakBuf, 0x00010000); WriteZero(trakBuf, 4);
+    WriteZero(trakBuf, 4); WriteZero(trakBuf, 4);
+    WriteU32(trakBuf, 0x00010000); WriteZero(trakBuf, 4);
+    WriteZero(trakBuf, 4); WriteZero(trakBuf, 4);
+    WriteU32(trakBuf, 0x40000000);
+    WriteU32(trakBuf, Width*0x10000); WriteU32(trakBuf, Height*0x10000);
+
+    // --- mdia ---
+    std::vector<uint8_t> mdiaBuf;
+    WriteU32(mdiaBuf, 32); WriteFourCC(mdiaBuf, "mdhd");
+    WriteU32(mdiaBuf, 0); WriteU32(mdiaBuf, 0); WriteU32(mdiaBuf, 0);
+    WriteU32(mdiaBuf, Timescale);
+    WriteU32(mdiaBuf, N * FrameDuration);
+    WriteU16(mdiaBuf, 0x55C4); WriteU16(mdiaBuf, 0);
+
+    WriteU32(mdiaBuf, 45); WriteFourCC(mdiaBuf, "hdlr");
+    WriteU32(mdiaBuf, 0); WriteU32(mdiaBuf, 0);
+    WriteFourCC(mdiaBuf, "vide"); WriteZero(mdiaBuf, 12);
+    WriteBytes(mdiaBuf, (const uint8_t*)"VideoHandler", 12);
+    WriteU8(mdiaBuf, 0);
+
+    // --- minf ---
+    std::vector<uint8_t> minfBuf;
+    WriteU32(minfBuf, 20); WriteFourCC(minfBuf, "vmhd");
+    WriteU32(minfBuf, 0x00000001);
+    WriteU16(minfBuf, 0); WriteZero(minfBuf, 6);
+
+    std::vector<uint8_t> dinfBuf;
+    WriteU32(dinfBuf, 28); WriteFourCC(dinfBuf, "dref");
+    WriteU32(dinfBuf, 0); WriteU32(dinfBuf, 1);
+    WriteU32(dinfBuf, 12); WriteFourCC(dinfBuf, "url ");
+    WriteU32(dinfBuf, 0x00000001);
+    minfBuf.insert(minfBuf.end(), dinfBuf.begin(), dinfBuf.end());
+
+    // --- stbl ---
+    std::vector<uint8_t> stblBuf;
+
+    // stsd
+    std::vector<uint8_t> stsdEntry;
+    WriteZero(stsdEntry, 6); WriteU16(stsdEntry, 1);
+    WriteU16(stsdEntry, 0); WriteU16(stsdEntry, 0);
+    WriteZero(stsdEntry, 12);
+    WriteU16(stsdEntry, Width); WriteU16(stsdEntry, Height);
+    WriteU32(stsdEntry, 0x00480000); WriteU32(stsdEntry, 0x00480000);
+    WriteU32(stsdEntry, 0); WriteU16(stsdEntry, 1);
+    WriteZero(stsdEntry, 32);
+    WriteU16(stsdEntry, 0x0018); WriteU16(stsdEntry, 0xFFFF);
+
+    // avcC
+    std::vector<uint8_t> avcCBuf;
+    uint32_t avcCSize = 19 + (uint32_t)(SPS.size() + PPS.size());
+    WriteU32(avcCBuf, avcCSize); WriteFourCC(avcCBuf, "avcC");
+    WriteU8(avcCBuf, 1);
+    WriteU8(avcCBuf, SPS.empty() ? 0x42 : SPS[1]);
+    WriteU8(avcCBuf, SPS.empty() ? 0x00 : SPS[2]);
+    WriteU8(avcCBuf, SPS.empty() ? 0x1F : SPS[3]);
+    WriteU8(avcCBuf, 0xFF);
+    WriteU8(avcCBuf, 0xE0 | (SPS.empty() ? 0 : 1));
+    WriteU16(avcCBuf, (uint16_t)SPS.size());
+    WriteBytes(avcCBuf, SPS.data(), SPS.size());
+    WriteU8(avcCBuf, PPS.empty() ? 0 : 1);
+    WriteU16(avcCBuf, (uint16_t)PPS.size());
+    WriteBytes(avcCBuf, PPS.data(), PPS.size());
+    stsdEntry.insert(stsdEntry.end(), avcCBuf.begin(), avcCBuf.end());
+
+    uint32_t avc1EntrySize = 86 + avcCSize;
     {
-        // --- tkhd ---
-        WriteU32(trakBuf, 92);
-        WriteFourCC(trakBuf, "tkhd");
-        WriteU32(trakBuf, 0x00000007);
-        WriteU32(trakBuf, 0); WriteU32(trakBuf, 0);
-        WriteU32(trakBuf, TrackID); WriteU32(trakBuf, 0);
-        WriteU32(trakBuf, 0); // duration = 0 for fMP4
-        WriteZero(trakBuf, 8);
-        WriteU16(trakBuf, 0); WriteU16(trakBuf, 0);
-        WriteU16(trakBuf, 0x0100); WriteU16(trakBuf, 0);
-        WriteU32(trakBuf, 0x00010000); WriteZero(trakBuf, 4);
-        WriteZero(trakBuf, 4); WriteU32(trakBuf, 0x00010000);
-        WriteZero(trakBuf, 12); WriteU32(trakBuf, 0x40000000);
-        WriteU32(trakBuf, Width*0x10000); WriteU32(trakBuf, Height*0x10000);
-
-        // --- mdia ---
-        std::vector<uint8_t> mdiaBuf;
-        WriteU32(mdiaBuf, 32); WriteFourCC(mdiaBuf, "mdhd");
-        WriteU32(mdiaBuf, 0); WriteU32(mdiaBuf, 0); WriteU32(mdiaBuf, 0);
-        WriteU32(mdiaBuf, Timescale); WriteU32(mdiaBuf, 0);
-        WriteU16(mdiaBuf, 0x55C4); WriteU16(mdiaBuf, 0);
-
-        WriteU32(mdiaBuf, 45); WriteFourCC(mdiaBuf, "hdlr");
-        WriteU32(mdiaBuf, 0); WriteU32(mdiaBuf, 0);
-        WriteFourCC(mdiaBuf, "vide"); WriteZero(mdiaBuf, 12);
-        WriteBytes(mdiaBuf, (const uint8_t*)"VideoHandler", 12);
-        WriteU8(mdiaBuf, 0);
-
-        // --- minf ---
-        std::vector<uint8_t> minfBuf;
-        WriteU32(minfBuf, 20); WriteFourCC(minfBuf, "vmhd");
-        WriteU32(minfBuf, 0x00000001);
-        WriteU16(minfBuf, 0); WriteZero(minfBuf, 6);
-
-        std::vector<uint8_t> dinfBuf;
-        WriteU32(dinfBuf, 28); WriteFourCC(dinfBuf, "dref");
-        WriteU32(dinfBuf, 0); WriteU32(dinfBuf, 1);
-        WriteU32(dinfBuf, 12); WriteFourCC(dinfBuf, "url ");
-        WriteU32(dinfBuf, 0x00000001);
-        minfBuf.insert(minfBuf.end(), dinfBuf.begin(), dinfBuf.end());
-
-        // --- stbl (仅 stsd) ---
-        std::vector<uint8_t> stblBuf;
-        WriteAvcC(stblBuf); // 先构建 avcC，得到大小
-        // 注意 WriteAvcC 写入了完整的 avcC box (header+data)，需要提取 payload 大小
-        // 在这里我们直接在 stsd 中构建
-        // 重新构建 stsd（由于 MP4Muxer 的设计问题，我们在此直接写）
-
-        std::vector<uint8_t> stsdBuf; // 我们要构建 stsd 内的 avc1 entry
-        // avc1 entry header (86 bytes)
-        WriteZero(stsdBuf, 6);
-        WriteU16(stsdBuf, 1);
-        WriteU16(stsdBuf, 0); WriteU16(stsdBuf, 0);
-        WriteZero(stsdBuf, 12);
-        WriteU16(stsdBuf, Width);
-        WriteU16(stsdBuf, Height);
-        WriteU32(stsdBuf, 0x00480000);
-        WriteU32(stsdBuf, 0x00480000);
-        WriteU32(stsdBuf, 0);
-        WriteU16(stsdBuf, 1);
-        WriteZero(stsdBuf, 32);
-        WriteU16(stsdBuf, 0x0018);
-        WriteU16(stsdBuf, 0xFFFF);
-
-        // avcC
-        std::vector<uint8_t> avcCBuf;
-        uint32_t avcCSize = 19 + (uint32_t)(SPS.size() + PPS.size());
-        WriteU32(avcCBuf, avcCSize);
-        WriteFourCC(avcCBuf, "avcC");
-        WriteU8(avcCBuf, 1);
-        WriteU8(avcCBuf, SPS.empty() ? 0x42 : SPS[1]);
-        WriteU8(avcCBuf, SPS.empty() ? 0x00 : SPS[2]);
-        WriteU8(avcCBuf, SPS.empty() ? 0x1F : SPS[3]);
-        WriteU8(avcCBuf, 0xFF);
-        WriteU8(avcCBuf, 0xE1);
-        WriteU16(avcCBuf, (uint16_t)SPS.size());
-        WriteBytes(avcCBuf, SPS.data(), SPS.size());
-        WriteU8(avcCBuf, 0x01);
-        WriteU16(avcCBuf, (uint16_t)PPS.size());
-        WriteBytes(avcCBuf, PPS.data(), PPS.size());
-
-        stsdBuf.insert(stsdBuf.end(), avcCBuf.begin(), avcCBuf.end());
-
-        uint32_t avc1EntrySize = 86 + avcCSize;
+        std::vector<uint8_t> stsdBox;
         uint32_t stsdSize = 16 + avc1EntrySize;
-
-        WriteU32(stblBuf, stsdSize);
-        WriteFourCC(stblBuf, "stsd");
-        WriteU32(stblBuf, 0);
-        WriteU32(stblBuf, 1);
-        WriteU32(stblBuf, avc1EntrySize);
-        WriteFourCC(stblBuf, "avc1");
-        WriteBytes(stblBuf, stsdBuf.data(), stsdBuf.size());
-
-        WriteU32(minfBuf, 8 + (uint32_t)stblBuf.size());
-        WriteFourCC(minfBuf, "stbl");
-        minfBuf.insert(minfBuf.end(), stblBuf.begin(), stblBuf.end());
-
-        WriteU32(mdiaBuf, 8 + (uint32_t)minfBuf.size());
-        WriteFourCC(mdiaBuf, "minf");
-        mdiaBuf.insert(mdiaBuf.end(), minfBuf.begin(), minfBuf.end());
-
-        WriteU32(trakBuf, 8 + (uint32_t)mdiaBuf.size());
-        WriteFourCC(trakBuf, "mdia");
-        trakBuf.insert(trakBuf.end(), mdiaBuf.begin(), mdiaBuf.end());
+        WriteU32(stsdBox, stsdSize); WriteFourCC(stsdBox, "stsd");
+        WriteU32(stsdBox, 0); WriteU32(stsdBox, 1);
+        WriteU32(stsdBox, avc1EntrySize); WriteFourCC(stsdBox, "avc1");
+        WriteBytes(stsdBox, stsdEntry.data(), stsdEntry.size());
+        stblBuf.insert(stblBuf.end(), stsdBox.begin(), stsdBox.end());
     }
 
-    // --- mvex ---
-    std::vector<uint8_t> mvexBuf;
-    WriteU32(mvexBuf, 16); WriteFourCC(mvexBuf, "mehd");
-    WriteU32(mvexBuf, 0);
-    WriteU32(mvexBuf, 0); // fragment_duration = 0 (unknown)
+    // stts: 所有帧 duration = FrameDuration
+    {
+        std::vector<uint8_t> box;
+        WriteU32(box, 16 + 8); WriteFourCC(box, "stts");
+        WriteU32(box, 0); WriteU32(box, 1);  // 1 entry, all same duration
+        WriteU32(box, N); WriteU32(box, FrameDuration);
+        stblBuf.insert(stblBuf.end(), box.begin(), box.end());
+    }
 
-    WriteU32(mvexBuf, 32); WriteFourCC(mvexBuf, "trex");
-    WriteU32(mvexBuf, 0);
-    WriteU32(mvexBuf, TrackID);
-    WriteU32(mvexBuf, 1);    // default_sample_description_index
-    WriteU32(mvexBuf, FrameDuration); // default_sample_duration
-    WriteU32(mvexBuf, 0);    // default_sample_size
-    WriteU32(mvexBuf, 0);    // default_sample_flags
+    // stsz: 每帧大小
+    {
+        std::vector<uint8_t> box;
+        WriteU32(box, 20 + N * 4); WriteFourCC(box, "stsz");
+        WriteU32(box, 0); WriteU32(box, 0);  // sample_size=0 (variable)
+        WriteU32(box, N);
+        for (auto& f : AllFrames)
+            WriteU32(box, (uint32_t)f.Avc1Data.size());
+        stblBuf.insert(stblBuf.end(), box.begin(), box.end());
+    }
 
-    WriteU32(trakBuf, 8 + (uint32_t)mvexBuf.size());
-    WriteFourCC(trakBuf, "mvex");
-    trakBuf.insert(trakBuf.end(), mvexBuf.begin(), mvexBuf.end());
+    // stsc: 全部帧在一个 chunk 中
+    {
+        std::vector<uint8_t> box;
+        WriteU32(box, 16 + 12); WriteFourCC(box, "stsc");
+        WriteU32(box, 0); WriteU32(box, 1);  // 1 entry
+        WriteU32(box, 1);     // first_chunk
+        WriteU32(box, N);     // samples_per_chunk
+        WriteU32(box, 1);     // sample_description_index
+        stblBuf.insert(stblBuf.end(), box.begin(), box.end());
+    }
+
+    // stco: chunk offset (mdat 数据起始位置)
+    // file layout: ftyp(24) + mdat_header(8) = 32
+    {
+        uint32_t mdatDataOffset = 24 + 8;
+        std::vector<uint8_t> box;
+        WriteU32(box, 16 + 4); WriteFourCC(box, "stco");
+        WriteU32(box, 0); WriteU32(box, 1);  // 1 entry
+        WriteU32(box, mdatDataOffset);
+        stblBuf.insert(stblBuf.end(), box.begin(), box.end());
+    }
+
+    // stss: 关键帧索引表
+    if (!syncSamples.empty())
+    {
+        std::vector<uint8_t> box;
+        WriteU32(box, 16 + (uint32_t)syncSamples.size() * 4);
+        WriteFourCC(box, "stss");
+        WriteU32(box, 0);
+        WriteU32(box, (uint32_t)syncSamples.size());
+        for (auto idx : syncSamples)
+            WriteU32(box, idx);
+        stblBuf.insert(stblBuf.end(), box.begin(), box.end());
+    }
+
+    WriteU32(minfBuf, 8 + (uint32_t)stblBuf.size());
+    WriteFourCC(minfBuf, "stbl");
+    minfBuf.insert(minfBuf.end(), stblBuf.begin(), stblBuf.end());
+
+    WriteU32(mdiaBuf, 8 + (uint32_t)minfBuf.size());
+    WriteFourCC(mdiaBuf, "minf");
+    mdiaBuf.insert(mdiaBuf.end(), minfBuf.begin(), minfBuf.end());
+
+    WriteU32(trakBuf, 8 + (uint32_t)mdiaBuf.size());
+    WriteFourCC(trakBuf, "mdia");
+    trakBuf.insert(trakBuf.end(), mdiaBuf.begin(), mdiaBuf.end());
+
+    // --- 包装 trak ---
+    uint32_t trakSize = 8 + (uint32_t)trakBuf.size();
+    std::vector<uint8_t> trakBox;
+    WriteU32(trakBox, trakSize); WriteFourCC(trakBox, "trak");
+    trakBox.insert(trakBox.end(), trakBuf.begin(), trakBuf.end());
 
     // --- mvhd ---
     std::vector<uint8_t> mvhdBuf;
     WriteU32(mvhdBuf, 108); WriteFourCC(mvhdBuf, "mvhd");
     WriteU32(mvhdBuf, 0); WriteU32(mvhdBuf, 0); WriteU32(mvhdBuf, 0);
     WriteU32(mvhdBuf, Timescale);
-    WriteU32(mvhdBuf, 0); // duration = 0 for fMP4
+    WriteU32(mvhdBuf, N * FrameDuration);
     WriteU32(mvhdBuf, 0x00010000); WriteU16(mvhdBuf, 0x0100); WriteU16(mvhdBuf, 0);
     WriteZero(mvhdBuf, 8);
     WriteU32(mvhdBuf, 0x00010000); WriteZero(mvhdBuf, 4);
-    WriteZero(mvhdBuf, 4); WriteU32(mvhdBuf, 0x00010000);
-    WriteZero(mvhdBuf, 12); WriteU32(mvhdBuf, 0x40000000);
+    WriteZero(mvhdBuf, 4); WriteZero(mvhdBuf, 4);
+    WriteU32(mvhdBuf, 0x00010000); WriteZero(mvhdBuf, 4);
+    WriteZero(mvhdBuf, 4); WriteZero(mvhdBuf, 4);
+    WriteU32(mvhdBuf, 0x40000000);
     WriteZero(mvhdBuf, 24); WriteU32(mvhdBuf, 2);
 
     // --- 组装 moov ---
-    uint32_t moovSize = 8 + (uint32_t)mvhdBuf.size() + (uint32_t)trakBuf.size();
+    uint32_t moovSize = 8 + (uint32_t)mvhdBuf.size() + (uint32_t)trakBox.size();
     std::vector<uint8_t> moovBuf;
     WriteU32(moovBuf, moovSize); WriteFourCC(moovBuf, "moov");
     moovBuf.insert(moovBuf.end(), mvhdBuf.begin(), mvhdBuf.end());
-    moovBuf.insert(moovBuf.end(), trakBuf.begin(), trakBuf.end());
+    moovBuf.insert(moovBuf.end(), trakBox.begin(), trakBox.end());
 
     FWrite(moovBuf, OutputFile);
-}
-
-// ============================================================================
-// avcC（在 WriteMoov 中内联使用）
-// ============================================================================
-
-void MP4Muxer::WriteAvcC(std::vector<uint8_t>& Out)
-{
-    (void)Out; // 不使用，在 WriteMoov 中直接构建
-}
-
-// ============================================================================
-// moof + mdat（写入一个 fragment）
-// ============================================================================
-
-void MP4Muxer::WriteMoofAndMdat()
-{
-    uint32_t N = (uint32_t)PendingFrames.size();
-    if (N == 0) return;
-
-    // 计算 mdat 数据大小
-    uint32_t mdatDataSize = 0;
-    for (auto& f : PendingFrames)
-        mdatDataSize += (uint32_t)f.Avc1Data.size();
-
-    // 计算 baseMediaDecodeTime（在 timescale 单位中）
-    // 本 fragment 的第一帧的全局帧索引 = TotalFrames - N（AddFrame 已递增 TotalFrames）
-    uint32_t firstFrameGlobal = TotalFrames - N;
-    uint32_t baseDecodeTime = firstFrameGlobal * FrameDuration;
-
-    // --- tfhd ---
-    std::vector<uint8_t> tfhd;
-    WriteU32(tfhd, 16); // size: 16 (without base_data_offset)
-    WriteFourCC(tfhd, "tfhd");
-    WriteU32(tfhd, 0);  // flags=0
-    WriteU32(tfhd, TrackID);
-
-    // --- tfdt (version 0) ---
-    std::vector<uint8_t> tfdt;
-    WriteU32(tfdt, 16);
-    WriteFourCC(tfdt, "tfdt");
-    WriteU32(tfdt, 0);
-    WriteU32(tfdt, baseDecodeTime);
-
-    // --- trun ---
-    // flags: 0x000005 = data_offset_present | first_sample_flags_present
-    // 不加 sample_duration/size 用 trex 默认值
-    // 但实际上 duration 恒定，size 每帧不同需要显式列出。用 flags=0x000205
-    // data_offset + first_sample_flags + sample_size
-    std::vector<uint8_t> trun;
-    uint32_t trunSize = 8 + 4 + 4 + 4 + 4 + N * 4; // header + data_offset + flags + count + N*sizes
-    WriteU32(trun, trunSize);
-    WriteFourCC(trun, "trun");
-    WriteU32(trun, 0x000205); // version=0, flags: data_offset + first_flags + sample_size
-    WriteU32(trun, N);        // sample_count
-
-    // data_offset: moof 结束后到 mdat 数据的偏移
-    // moof size = 8 + mfhd(16) + traf(8+tfhd+tfdt+trun)
-    uint32_t trafSize = 8 + (uint32_t)tfhd.size() + (uint32_t)tfdt.size() + (uint32_t)trunSize;
-    uint32_t mfhdSize = 16;
-    uint32_t moofSize = 8 + mfhdSize + trafSize;
-    WriteU32(trun, moofSize + 8); // mdat 数据从 moof 结尾后 8 字节开始（8 = mdat header）
-
-    // first_sample_flags: keyframe 标记
-    uint32_t firstFlags = 0;
-    if (!PendingFrames.empty() && PendingFrames[0].bKeyFrame)
-        firstFlags = 0x02000000; // sample_is_non_sync_sample = 0 → 关键帧（不设就是非关键帧）
-    // 实际上 ISOBMFF 的 sample_flags: bit 16 是 sample_depends_on, 值 2 = depends on others
-    // 对于 IDR: flags = 0x02000000 (sample_depends_on=2, is_leading=0, ...)
-    // Wait, the correct flag for sync sample is 0x02000000 which means "does not depend on others"
-    // For non-sync frames, it's 0x01010000
-    if (firstFlags == 0)
-        firstFlags = 0x01010000; // depends on others (non-keyframe)
-    else
-        firstFlags = 0x02000000;
-    WriteU32(trun, firstFlags);
-
-    // 每帧的 size
-    for (auto& f : PendingFrames)
-        WriteU32(trun, (uint32_t)f.Avc1Data.size());
-
-    // --- mfhd ---
-    std::vector<uint8_t> mfhd;
-    WriteU32(mfhd, 16);
-    WriteFourCC(mfhd, "mfhd");
-    WriteU32(mfhd, 0);
-    WriteU32(mfhd, FragmentSequence++);
-
-    // --- 组装 traf ---
-    std::vector<uint8_t> traf;
-    WriteU32(traf, trafSize);
-    WriteFourCC(traf, "traf");
-    traf.insert(traf.end(), tfhd.begin(), tfhd.end());
-    traf.insert(traf.end(), tfdt.begin(), tfdt.end());
-    traf.insert(traf.end(), trun.begin(), trun.end());
-
-    // --- 组装 moof ---
-    std::vector<uint8_t> moof;
-    WriteU32(moof, moofSize);
-    WriteFourCC(moof, "moof");
-    moof.insert(moof.end(), mfhd.begin(), mfhd.end());
-    moof.insert(moof.end(), traf.begin(), traf.end());
-
-    // --- mdat ---
-    std::vector<uint8_t> mdat;
-    WriteU32(mdat, 8 + mdatDataSize);
-    WriteFourCC(mdat, "mdat");
-    for (auto& f : PendingFrames)
-        WriteBytes(mdat, f.Avc1Data.data(), f.Avc1Data.size());
-
-    // 写入文件
-    FWrite(moof, OutputFile);
-    FWrite(mdat, OutputFile);
 }

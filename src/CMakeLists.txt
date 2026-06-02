@@ -33,6 +33,12 @@ if(VANE_DEBUG_TIMING)
     target_compile_definitions(Vane PRIVATE VANE_DEBUG_TIMING=1)
 endif()
 
+# 无 DRM 环境下的模拟编码模式（仅用于开发/测试管线逻辑）
+option(VANE_FAKE_VAAPI "Enable fake VA-API mode when DRM is unavailable (dev/test only)" OFF)
+if(VANE_FAKE_VAAPI)
+    target_compile_definitions(Vane PRIVATE VANE_FAKE_VAAPI=1)
+endif()
+
 # 跨平台核心（始终编译）
 target_sources(Vane PRIVATE
     VaneAPI.cpp
@@ -118,15 +124,13 @@ elseif(PLATFORM_WINDOWS)
 elseif(PLATFORM_LINUX)
     target_compile_definitions(Vane PRIVATE PLATFORM_LINUX=1)
 
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(LIBVA REQUIRED libva)
-    pkg_check_modules(LIBVA_DRM REQUIRED libva-drm)
+    find_library(LIBVA_LIB va REQUIRED)
+    find_library(LIBVA_DRM_LIB va-drm REQUIRED)
 
     target_sources(Vane PRIVATE
         FVAEncoder.cpp
         MP4Muxer.cpp
     )
 
-    target_include_directories(Vane PRIVATE ${LIBVA_INCLUDE_DIRS} ${LIBVA_DRM_INCLUDE_DIRS})
-    target_link_libraries(Vane PUBLIC ${LIBVA_LIBRARIES} ${LIBVA_DRM_LIBRARIES})
+    target_link_libraries(Vane PUBLIC ${LIBVA_LIB} ${LIBVA_DRM_LIB})
 endif()
