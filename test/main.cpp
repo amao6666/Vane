@@ -2,8 +2,8 @@
     #include "mac/FVTEncoder.h"
     using FPlatformEncoder = FVTEncoder;
 #elif defined(_WIN32)
-    #include "FMFEncoder.h"
-    using FPlatformEncoder = FMFEncoder;
+    #include "windows/FWindowsEncoder.h"
+    using FPlatformEncoder = FWindowsEncoder;
 #elif defined(__linux__)
     #include "linux/FVAEncoder.h"
     using FPlatformEncoder = FVAEncoder;

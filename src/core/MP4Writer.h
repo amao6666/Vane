@@ -4,6 +4,8 @@
 #include <vector>
 #include <cstdio>
 
+#include "Vane/VaneAPI.h"
+
 using int32 = int32_t;
 using int64 = int64_t;
 using uint8 = uint8_t;
@@ -11,7 +13,7 @@ using uint8 = uint8_t;
 // 普通 MP4 封装器（moov 在文件末尾，非 fMP4）
 // 将 H.264 Annex B 裸流封装为 avc1 格式的 MP4 文件
 // 与 src/MP4Muxer.h（Linux fMP4）并行存在，不修改现有代码
-class MP4Writer
+class VANE_API MP4Writer
 {
 public:
     MP4Writer();

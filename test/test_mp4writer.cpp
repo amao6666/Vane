@@ -10,7 +10,7 @@
 #include <string>
 
 #ifdef _WIN32
-#define DeleteTestFile(p) DeleteTestFile(p)
+#define DeleteTestFile(p) DeleteFileA(p)
 #else
 #define DeleteTestFile(p) remove(p)
 #endif

@@ -6,7 +6,7 @@
 struct FVTEncoderImpl;
 
 // macOS VideoToolbox 硬件编码器封装
-class FVTEncoder : public IVideoEncoder
+class VANE_API FVTEncoder : public IVideoEncoder
 {
 public:
     FVTEncoder();

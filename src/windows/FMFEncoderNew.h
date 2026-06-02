@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "Vane/VaneAPI.h"
 #include "Vane/VaneConfig.h"
 
 using int32 = int32_t;
@@ -12,7 +13,7 @@ using int64 = int64_t;
 // Media Foundation 编码器（P2 兜底，双模式：H.264 / WMV）
 // H.264 模式：IMFTransform → Annex B → 外部 MP4Writer 封装
 // WMV 模式：MFSinkWriter 直接写 ASF/WMV 文件（容器+编码一体）
-class FMFEncoderNew
+class VANE_API FMFEncoderNew
 {
 public:
     FMFEncoderNew();

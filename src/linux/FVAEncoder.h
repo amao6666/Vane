@@ -6,7 +6,7 @@
 struct FVAEncoderImpl;
 
 // Linux VA-API 硬件编码器封装（输出 H.264 裸流，内置 MP4Muxer 封装为 fMP4）
-class FVAEncoder : public IVideoEncoder
+class VANE_API FVAEncoder : public IVideoEncoder
 {
 public:
     FVAEncoder();

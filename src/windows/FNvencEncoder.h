@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "Vane/VaneAPI.h"
 #include "Vane/VaneConfig.h"
 
 using int32 = int32_t;
@@ -15,7 +16,7 @@ typedef struct _NV_ENCODE_API_FUNCTION_LIST NV_ENCODE_API_FUNCTION_LIST;
 
 // NVENC 原生编码器（P0 首选）
 // 通过 LoadLibrary("nvEncodeAPI64.dll") 动态加载，编译期零 NVENC SDK 库依赖
-class FNvencEncoder
+class VANE_API FNvencEncoder
 {
 public:
     FNvencEncoder();
