@@ -26,7 +26,7 @@ public:
     bool EncodeFrame(const void* pInputTexture, int32 Width, int32 Height,
                      std::vector<uint8_t>& OutAnnexB, bool& OutIsKeyFrame);
     bool Finalize(std::string& OutError);
-    const char* GetCodecName() const { return "NVENC H.264"; }
+    const char* GetCodecName() const { return EncoderCodec == "h265" ? "NVENC H.265" : "NVENC H.264"; }
     void* GetEncoderHandle() const { return EncoderHandle; }
 
     // 检查 DLL 是否存在（快速检查，不保证 codec 可用）
@@ -52,6 +52,7 @@ private:
     int32 FrameRate = 0;
     int32 BitRate = 0;
     int32 FrameIndex = 0;
+    std::string EncoderCodec = "h264";
 
     bool CreateAndRegisterResource(void* pD3D11Texture, int32 Width, int32 Height);
     bool GetEncodedBitstream(std::vector<uint8_t>& OutAnnexB, bool& OutIsKeyFrame);

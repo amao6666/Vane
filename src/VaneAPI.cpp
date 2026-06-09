@@ -28,22 +28,23 @@ VANE_API void VaneEncoder_Destroy(void* Encoder)
     delete static_cast<IVideoEncoder*>(Encoder);
 }
 
+// 返回值约定：0=成功，-1=失败（标准 C ABI 惯例）
 VANE_API int VaneEncoder_Initialize(void* Encoder, const FEncoderConfig* Config)
 {
     auto* enc = static_cast<IVideoEncoder*>(Encoder);
-    return enc && Config && enc->Initialize(*Config) ? 1 : 0;
+    return (enc && Config && enc->Initialize(*Config)) ? 0 : -1;
 }
 
 VANE_API int VaneEncoder_StartRecording(void* Encoder, const char* OutputPath)
 {
     auto* enc = static_cast<IVideoEncoder*>(Encoder);
-    return enc && enc->StartRecording(OutputPath) ? 1 : 0;
+    return (enc && enc->StartRecording(OutputPath)) ? 0 : -1;
 }
 
 VANE_API int VaneEncoder_EncodeFrame(void* Encoder, const uint8_t* RawBGRA, int DataSize, double TimestampSeconds)
 {
     auto* enc = static_cast<IVideoEncoder*>(Encoder);
-    return enc && enc->EncodeFrame(RawBGRA, DataSize, TimestampSeconds) ? 1 : 0;
+    return (enc && enc->EncodeFrame(RawBGRA, DataSize, TimestampSeconds)) ? 0 : -1;
 }
 
 VANE_API void VaneEncoder_StopRecording(void* Encoder)
@@ -61,7 +62,7 @@ VANE_API void VaneEncoder_RequestStop(void* Encoder)
 VANE_API int VaneEncoder_IsRecording(void* Encoder)
 {
     auto* enc = static_cast<IVideoEncoder*>(Encoder);
-    return enc && enc->IsRecording() ? 1 : 0;
+    return (enc && enc->IsRecording()) ? 1 : 0; // bool query — 1=recording, 0=not
 }
 
 VANE_API const char* VaneEncoder_GetLastError(void* Encoder)

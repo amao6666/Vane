@@ -148,8 +148,19 @@ bool FNvencEncoder::Initialize(void* pD3D11Device, const FEncoderConfig& Config,
     if (bInitialized) return true;
     if (!pD3D11Device) { OutError = "NVENC: D3D11 Device 为空"; return false; }
 
-    EncodeWidth  = Config.Width;
-    EncodeHeight = Config.Height;
+    // NVENC requires encodeWidth/encodeHeight to be multiples of 16 (H.264) or 32 (HEVC).
+    // Auto-align upward and warn if the original values weren't aligned.
+    int32 AlignTo = 16;
+    int32 AlignedW = (Config.Width  + AlignTo - 1) & ~(AlignTo - 1);
+    int32 AlignedH = (Config.Height + AlignTo - 1) & ~(AlignTo - 1);
+    if (AlignedW != Config.Width || AlignedH != Config.Height) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "NVENC: 分辨率 %dx%d 已自动对齐到 %dx%d（编码器要求 %d 像素对齐）",
+                 (int)Config.Width, (int)Config.Height, (int)AlignedW, (int)AlignedH, AlignTo);
+        // Log warning but don't store in OutError (just a notice)
+    }
+    EncodeWidth  = AlignedW;
+    EncodeHeight = AlignedH;
     FrameRate    = Config.FrameRate;
     BitRate      = Config.BitRate;
 
@@ -197,7 +208,13 @@ bool FNvencEncoder::Initialize(void* pD3D11Device, const FEncoderConfig& Config,
         return false;
     }
 
+    // Select codec GUID based on Config.Codec ("h264" or "h265"/"hevc")
     GUID codecGuid  = NV_ENC_CODEC_H264_GUID;
+    if (Config.Codec && (strcmp(Config.Codec, "h265") == 0 || strcmp(Config.Codec, "hevc") == 0))
+    {
+        codecGuid = NV_ENC_CODEC_HEVC_GUID;
+        EncoderCodec = "h265";
+    }
     GUID presetGuid = NV_ENC_PRESET_P4_GUID;
 
     // 按照 NVIDIA SDK 参考模式初始化预设配置
@@ -232,11 +249,19 @@ bool FNvencEncoder::Initialize(void* pD3D11Device, const FEncoderConfig& Config,
     encConfig.rcParams.minQP = { 1, 1, 1 };
     encConfig.rcParams.enableMaxQP = 1;
     encConfig.rcParams.maxQP = { 35, 35, 35 };
-    encConfig.encodeCodecConfig.h264Config.repeatSPSPPS  = 1;
-    encConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
-    encConfig.encodeCodecConfig.h264Config.idrPeriod     = encConfig.gopLength;
-    // CBR 填充：使用合法 H.264 filler NAL (type 12) 而非 raw 0xFF 字节
-    encConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion = 1;
+    if (codecGuid == NV_ENC_CODEC_HEVC_GUID)
+    {
+        encConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS  = 1;
+        encConfig.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
+        encConfig.encodeCodecConfig.hevcConfig.idrPeriod     = encConfig.gopLength;
+    }
+    else
+    {
+        encConfig.encodeCodecConfig.h264Config.repeatSPSPPS  = 1;
+        encConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
+        encConfig.encodeCodecConfig.h264Config.idrPeriod     = encConfig.gopLength;
+        encConfig.encodeCodecConfig.h264Config.enableFillerDataInsertion = 1;
+    }
 
     NV_ENC_INITIALIZE_PARAMS initParams = {};
     initParams.version              = NV_ENC_INITIALIZE_PARAMS_VER;

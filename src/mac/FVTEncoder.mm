@@ -570,12 +570,12 @@ const char* FVTEncoder::GetLastError() const
 
 FEncoderCapability FVTEncoder::CheckCapability() const
 {
-    FEncoderCapability cap;
+    FEncoderCapability cap = {};
     cap.bH264Available = true;
     cap.bHEVCAvailable = true;
-    cap.H264EncoderName = "VideoToolbox (macOS)";
-    cap.RecommendedFormat = "h264";
-    cap.DiagnosticInfo = "macOS VideoToolbox: H.264/H.265 硬件编码始终可用";
+    snprintf(cap.H264EncoderName, sizeof(cap.H264EncoderName), "VideoToolbox (macOS)");
+    snprintf(cap.RecommendedFormat, sizeof(cap.RecommendedFormat), "h264");
+    snprintf(cap.DiagnosticInfo, sizeof(cap.DiagnosticInfo), "macOS VideoToolbox: H.264/H.265 硬件编码始终可用");
     return cap;
 }
 

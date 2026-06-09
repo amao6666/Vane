@@ -192,7 +192,8 @@ bool FWindowsEncoder::StartRecording(const char* OutputPath)
     if (CreateInternalEncoder(actualType, Ptr->D3D11Device, Ptr->Config, enc, err))
     {
         // NVENC 需额外验证 D3D11Converter（GPU BGRA→NV12 转换必须可用）
-        if (actualType == EWindowsEncoderType::NVENC)
+        // bForceSoftwareConversion 跳过了 GPU 路径，直接使用 CPU 转换
+        if (actualType == EWindowsEncoderType::NVENC && !Ptr->Config.bForceSoftwareConversion)
         {
             if (Ptr->D3D11Device)
             {
@@ -420,6 +421,12 @@ bool FWindowsEncoder::StartRecording(const char* OutputPath)
                 {
                     bEncoded = enc->EncodeFrame(nv12Tex, w, h, annexB, bIsKeyFrame);
                 }
+            }
+            else
+            {
+                // CPU fallback: no D3D11Converter (e.g., bForceSoftwareConversion)
+                ColorSpaceConverter::ConvertBGRAToNV12_CPU(Frame.Data, w, h, p->Nv12Buf.data());
+                bEncoded = enc->EncodeFrame(p->Nv12Buf.data(), w, h, annexB, bIsKeyFrame);
             }
             break;
         }
@@ -693,13 +700,15 @@ const char* FWindowsEncoder::GetLastError() const
     return Ptr->LastError.c_str();
 }
 
+static void AppendDiag(char* Buf, size_t BufSize, const char* Str)
+{
+    strcat_s(Buf, BufSize, Str);
+}
+
 FEncoderCapability FWindowsEncoder::CheckCapability() const
 {
-    FEncoderCapability cap;
-    cap.DiagnosticInfo.reserve(1024);
+    FEncoderCapability cap = {};
 
-    // P0 修复：使用真实编码会话探测
-    // IsH264Supported(nullptr) 安全检查静态缓存，不写入（需有效 Device 才会写入缓存）
     bool bNvencDll  = FNvencEncoder::IsAvailable();
     bool bNvencH264 = bNvencDll && FNvencEncoder::IsH264Supported(Ptr->D3D11Device);
     bool bNvencHEVC = bNvencDll && FNvencEncoder::IsHEVCSupported(Ptr->D3D11Device);
@@ -712,63 +721,65 @@ FEncoderCapability FWindowsEncoder::CheckCapability() const
     cap.bHEVCAvailable         = bNvencHEVC;
     cap.bWMVAvailable          = bMFWMV;
 
-    cap.DiagnosticInfo += "=== 编码器探测（真实会话验证） ===\n";
-    cap.DiagnosticInfo += "  [P0] NVIDIA NVENC:\n";
-    cap.DiagnosticInfo += "    DLL: ";
-    cap.DiagnosticInfo += bNvencDll ? "已找到\n" : "未找到\n";
+    auto& D = cap.DiagnosticInfo;
+    size_t N = sizeof(cap.DiagnosticInfo);
+    AppendDiag(D, N, "=== 编码器探测（真实会话验证） ===\n");
+    AppendDiag(D, N, "  [P0] NVIDIA NVENC:\n");
+    AppendDiag(D, N, "    DLL: ");
+    AppendDiag(D, N, bNvencDll ? "已找到\n" : "未找到\n");
     if (bNvencDll)
     {
-        cap.DiagnosticInfo += "    H.264 编码: ";
+        AppendDiag(D, N, "    H.264 编码: ");
         if (bNvencH264)
-            cap.DiagnosticInfo += "可用\n";
+            AppendDiag(D, N, "可用\n");
         else if (!Ptr->D3D11Device)
-            cap.DiagnosticInfo += "无法检测（D3D11 Device 未设置）\n";
+            AppendDiag(D, N, "无法检测（D3D11 Device 未设置）\n");
         else
-            cap.DiagnosticInfo += "不可用（GPU/驱动不支持）\n";
-        cap.DiagnosticInfo += "    H.265 编码: ";
+            AppendDiag(D, N, "不可用（GPU/驱动不支持）\n");
+        AppendDiag(D, N, "    H.265 编码: ");
         if (bNvencHEVC)
-            cap.DiagnosticInfo += "可用\n";
+            AppendDiag(D, N, "可用\n");
         else if (!Ptr->D3D11Device)
-            cap.DiagnosticInfo += "无法检测（D3D11 Device 未设置）\n";
+            AppendDiag(D, N, "无法检测（D3D11 Device 未设置）\n");
         else
-            cap.DiagnosticInfo += "不可用\n";
+            AppendDiag(D, N, "不可用\n");
     }
-    cap.DiagnosticInfo += "  [P1] AMD AMF: ";
-    cap.DiagnosticInfo += bAmf ? "DLL 已找到（实现 TODO）\n" : "未找到\n";
-    cap.DiagnosticInfo += "  [P2] Media Foundation H.264: ";
-    cap.DiagnosticInfo += bMFH264 ? "硬件编码器可用\n" : "不可用（缺少系统 codec）\n";
-    cap.DiagnosticInfo += "  [P3] Media Foundation WMV: ";
-    cap.DiagnosticInfo += bMFWMV ? "始终可用（兜底）\n" : "不可用\n";
+    AppendDiag(D, N, "  [P1] AMD AMF: ");
+    AppendDiag(D, N, bAmf ? "DLL 已找到（实现 TODO）\n" : "未找到\n");
+    AppendDiag(D, N, "  [P2] Media Foundation H.264: ");
+    AppendDiag(D, N, bMFH264 ? "硬件编码器可用\n" : "不可用（缺少系统 codec）\n");
+    AppendDiag(D, N, "  [P3] Media Foundation WMV: ");
+    AppendDiag(D, N, bMFWMV ? "始终可用（兜底）\n" : "不可用\n");
 
     if (bNvencH264)
     {
-        cap.H264EncoderName = "NVIDIA NVENC (原生 H.264)";
-        cap.RecommendedFormat = "h264";
-        cap.DiagnosticInfo += "  选择: NVENC H.264 硬件编码\n";
+        strcpy_s(cap.H264EncoderName, "NVIDIA NVENC (原生 H.264)");
+        strcpy_s(cap.RecommendedFormat, "h264");
+        AppendDiag(D, N, "  选择: NVENC H.264 硬件编码\n");
     }
     else if (bAmf)
     {
-        cap.H264EncoderName = "AMD AMF (原生)";
-        cap.RecommendedFormat = "h264";
-        cap.DiagnosticInfo += "  选择: AMF H.264 硬件编码\n";
+        strcpy_s(cap.H264EncoderName, "AMD AMF (原生)");
+        strcpy_s(cap.RecommendedFormat, "h264");
+        AppendDiag(D, N, "  选择: AMF H.264 硬件编码\n");
     }
     else if (bMFH264)
     {
-        cap.H264EncoderName = "Media Foundation H.264 硬件编码";
-        cap.RecommendedFormat = "h264";
-        cap.DiagnosticInfo += "  选择: MF H.264 硬件编码\n";
+        strcpy_s(cap.H264EncoderName, "Media Foundation H.264 硬件编码");
+        strcpy_s(cap.RecommendedFormat, "h264");
+        AppendDiag(D, N, "  选择: MF H.264 硬件编码\n");
     }
     else if (bMFWMV)
     {
-        cap.H264EncoderName = "Windows Media Video (WMV)";
-        cap.RecommendedFormat = "wmv";
-        cap.DiagnosticInfo += "  选择: WMV（无 H.264 编码器可用）\n";
+        strcpy_s(cap.H264EncoderName, "Windows Media Video (WMV)");
+        strcpy_s(cap.RecommendedFormat, "wmv");
+        AppendDiag(D, N, "  选择: WMV（无 H.264 编码器可用）\n");
     }
     else
     {
-        cap.H264EncoderName = "无可用编码器";
-        cap.RecommendedFormat = "none";
-        cap.DiagnosticInfo += "  警告: 未找到任何可用视频编码器\n";
+        strcpy_s(cap.H264EncoderName, "无可用编码器");
+        strcpy_s(cap.RecommendedFormat, "none");
+        AppendDiag(D, N, "  警告: 未找到任何可用视频编码器\n");
     }
 
     return cap;

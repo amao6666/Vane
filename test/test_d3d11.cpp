@@ -222,8 +222,8 @@ static void TestEncodeWithD3D11()
     cfg.KeyframeInterval = 30;
 
     int init = VaneEncoder_Initialize(enc, &cfg);
-    std::cout << "  Initialize: " << (init ? "OK" : "FAIL") << std::endl;
-    if (!init)
+    std::cout << "  Initialize: " << (init == 0 ? "OK" : "FAIL") << std::endl;
+    if (init != 0)
     {
         std::cout << "  LastError: " << VaneEncoder_GetLastError(enc) << std::endl;
         VaneEncoder_Destroy(enc);
@@ -234,7 +234,7 @@ static void TestEncodeWithD3D11()
     // 4. 查询编码器能力，判断输出格式
     FEncoderCapability cap;
     VaneEncoder_CheckCapability(enc, &cap);
-    bool bIsWMV = (cap.RecommendedFormat == "wmv");
+    bool bIsWMV = (strcmp(cap.RecommendedFormat, "wmv") == 0);
     const char* outputPath = bIsWMV ? "test_d3d11_output.wmv" : "test_d3d11_output.mp4";
     std::cout << "  输出格式: " << (bIsWMV ? "WMV (ASF)" : "H.264 (MP4)") << std::endl;
 
@@ -244,9 +244,9 @@ static void TestEncodeWithD3D11()
 
     // 5. 开始录制
     int start = VaneEncoder_StartRecording(enc, outputPath);
-    std::cout << "  StartRecording(" << outputPath << "): " << (start ? "OK" : "FAIL") << std::endl;
-    CHECK(start != 0, "StartRecording 失败");
-    if (!start)
+    std::cout << "  StartRecording(" << outputPath << "): " << (start == 0 ? "OK" : "FAIL") << std::endl;
+    CHECK(start == 0, "StartRecording 失败");
+    if (start != 0)
     {
         std::cout << "  LastError: " << VaneEncoder_GetLastError(enc) << std::endl;
         VaneEncoder_Destroy(enc);
@@ -265,7 +265,7 @@ static void TestEncodeWithD3D11()
 
         double ts = static_cast<double>(i) / FPS;
         int encOk = VaneEncoder_EncodeFrame(enc, bgraBuf.data(), frameSize, ts);
-        if (!encOk)
+        if (encOk != 0)
         {
             std::cerr << "  EncodeFrame #" << i << " 失败: "
                       << VaneEncoder_GetLastError(enc) << std::endl;

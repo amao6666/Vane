@@ -773,12 +773,12 @@ const char* FVAEncoder::GetLastError() const
 
 FEncoderCapability FVAEncoder::CheckCapability() const
 {
-    FEncoderCapability cap;
+    FEncoderCapability cap = {};
     cap.bH264Available = true;
     cap.bHEVCAvailable = true;
-    cap.H264EncoderName = "VA-API (Linux)";
-    cap.RecommendedFormat = "h264";
-    cap.DiagnosticInfo = "Linux VA-API: H.264/H.265 硬件编码（取决于驱动支持）";
+    snprintf(cap.H264EncoderName, sizeof(cap.H264EncoderName), "VA-API (Linux)");
+    snprintf(cap.RecommendedFormat, sizeof(cap.RecommendedFormat), "h264");
+    snprintf(cap.DiagnosticInfo, sizeof(cap.DiagnosticInfo), "Linux VA-API: H.264/H.265 硬件编码（取决于驱动支持）");
     return cap;
 }
 

@@ -156,7 +156,7 @@ static bool RunEncoderTest(const char* encoderName, const char* outputPath,
     cfg.bUserPreferH264 = bPreferH264;
     cfg.bAllowFormatFallback = true;
 
-    if (!VaneEncoder_Initialize(enc, &cfg))
+    if (VaneEncoder_Initialize(enc, &cfg) != 0)
     {
         std::cout << "  Initialize 失败: " << VaneEncoder_GetLastError(enc) << std::endl;
         VaneEncoder_Destroy(enc);
@@ -172,7 +172,7 @@ static bool RunEncoderTest(const char* encoderName, const char* outputPath,
     std::cout << "  编码器类型: " << (encType >= 0 ? typeNames[encType] : "None") << std::endl;
 #endif
 
-    if (!VaneEncoder_StartRecording(enc, outputPath))
+    if (VaneEncoder_StartRecording(enc, outputPath) != 0)
     {
         std::cout << "  StartRecording 失败: " << VaneEncoder_GetLastError(enc) << std::endl;
         VaneEncoder_Destroy(enc);
@@ -187,7 +187,7 @@ static bool RunEncoderTest(const char* encoderName, const char* outputPath,
     {
         FillTestFrame(bgraBuf.data(), W, H, i);
         double ts = static_cast<double>(i) / FPS;
-        if (VaneEncoder_EncodeFrame(enc, bgraBuf.data(), frameSize, ts))
+        if (VaneEncoder_EncodeFrame(enc, bgraBuf.data(), frameSize, ts) == 0) // 0=success
             ++encodedOk;
         auto trg = t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>((i + 1) / static_cast<double>(FPS)));

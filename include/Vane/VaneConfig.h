@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
 
 // 编码器类型（Windows 平台）
 enum class VaneEncoderType
@@ -12,16 +11,16 @@ enum class VaneEncoderType
     MF    = 2,
 };
 
-// 编码器能力检测结果
+// 编码器能力检测结果 — 固定大小字符数组，跨 DLL 边界安全
 struct FEncoderCapability
 {
-    bool        bH264Available         = false; // 是否支持 H.264 硬件编码
-    bool        bH264SoftwareAvailable = false; // 是否支持 H.264 软件编码
-    bool        bHEVCAvailable         = false; // 是否支持 H.265 硬件编码
-    bool        bWMVAvailable          = true;  // WMV 始终可用（Windows 自带）
-    std::string H264EncoderName;                // 实际 H.264 编码器名称
-    std::string RecommendedFormat;              // "h264" 或 "wmv"
-    std::string DiagnosticInfo;                 // 编码器状态明细
+    bool bH264Available         = false;
+    bool bH264SoftwareAvailable = false;
+    bool bHEVCAvailable         = false;
+    bool bWMVAvailable          = true;
+    char H264EncoderName[256]   = {};
+    char RecommendedFormat[64]  = {};
+    char DiagnosticInfo[2048]   = {};
 };
 
 // 编码器配置（所有平台通用）
@@ -41,4 +40,5 @@ struct FEncoderConfig
     bool        bAllowCodecFallback = true; // 允许降级到备选编码器（含 WMV）
     bool        bUserPreferH264     = true; // 用户偏好 H.264，默认 true
     bool        bAllowFormatFallback = true; // H.264 不可用时是否自动降级到 WMV
+    bool        bForceSoftwareConversion = false; // 强制使用 CPU 颜色转换，跳过 D3D11Converter
 };
