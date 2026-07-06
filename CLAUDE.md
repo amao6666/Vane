@@ -2,125 +2,217 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## 项目概述
+## AI Behavior Rules (Highest Priority)
 
-Vane 是一个跨平台视频编码抽象库，为 macOS (VideoToolbox)、Windows (Media Foundation / NVENC / AMF)、Linux (VA-API) 提供统一的 C++17 接口，附带 C ABI 导出层供 UE 等引擎集成。MIT 许可证。
+These rules override all other instructions in this file. Violating any of them will produce unacceptable code.
 
-## 构建与测试
+**RULE 1: Think Before Coding**
+- Stop and ask when requirements are ambiguous. Do NOT guess or make assumptions about business logic, API contracts, or user intent.
+- If a task can be interpreted multiple ways, list the options and let the developer choose before implementing.
+- When asked a question about the codebase, first explain your understanding, then ask clarifying questions before proposing solutions.
+- NEVER silently correct what you think is a mistake — flag it and ask.
+
+**RULE 2: Simplicity First**
+- Write the minimum code needed to satisfy the exact requirement. No more.
+- Do NOT add features, abstractions, configuration options, or extensibility points unless explicitly requested.
+- Do NOT refactor "while you're at it" unless the task explicitly includes refactoring.
+- If a single function will do, do NOT create a class. If a simple script will do, do NOT create a module hierarchy.
+- Reuse existing patterns in the codebase — do NOT introduce new patterns just because they're "better practice."
+
+**RULE 3: Surgical Changes**
+- Only touch code directly related to the task. Do NOT reformat, fix style, reorganize imports, or rename things outside the change scope.
+- Your diff should show ONLY the lines relevant to the change. A clean diff is more valuable than a "cleaned up" file.
+
+**RULE 4: Goal-Driven Execution**
+- First confirm the acceptance criteria (what must be true for the task to be "done").
+- Work iteratively: implement → test/verify → fix → repeat until criteria are met.
+- If you hit a blocker, report it immediately with specific details. Do NOT silently work around a problem.
+
+**RULE 5: Explicit Reasoning**
+- Before writing or modifying code, first briefly state your plan (bullet points are fine).
+- After implementing, briefly verify against the acceptance criteria.
+
+---
+
+## Project Overview
+
+Vane is a cross-platform video encoding abstraction library. It provides a unified C++17 interface over hardware encoders on macOS (VideoToolbox), Windows (NVENC / AMF / Media Foundation), and Linux (VA-API). A C ABI export layer enables integration with engines like Unreal Engine via dynamic linking. MIT license.
+
+**Platform support:** macOS (VideoToolbox + H.264 fMP4) | Windows (NVENC → AMF → MF auto-select + H.264 MP4) | Linux (VA-API + H.264 fMP4)
+
+## Build & Test
 
 ```bash
-# 构建（仅当前平台）
+# Build (current platform only)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# 带编码延迟的压力测试
+# Run tests
+./build/test/VaneTest                         # Main test (4 scenarios: drop/stall/async-stop/throughput)
+./build/test/Release/AllEncodersTest.exe      # Windows: all-encoder validation
+./build/test/Release/Mp4WriterTest.exe        # Windows: MP4Writer unit test
+./build/test/Release/D3D11Test.exe            # Windows: D3D11 device creation test
+
+# Stress test with encoding delay
 cmake -S . -B build -DVANE_TEST_ENCODING_DELAY_MS=80 && cmake --build build
-
-# 运行主测试（四场景：丢帧/卡顿/异步Stop/吞吐量）
-./build/test/VaneTest
-
-# Windows 上还有两个独立测试
-./build/test/Mp4WriterTest
-./build/test/D3D11Test
 ```
 
-| CMake 选项 | 默认值 | 说明 |
+| CMake option | Default | Description |
 |---|---|---|
-| `VANE_BUILD_SHARED` | ON | ON=动态库, OFF=静态库 |
-| `VANE_TEST_ENCODING_DELAY_MS` | 0 | 注入人工编码延迟(ms)，0=关闭 |
-| `VANE_DEBUG_TIMING` | OFF | 编码管线计时诊断日志 |
+| `VANE_BUILD_SHARED` | ON | ON=dynamic library, OFF=static library |
+| `VANE_TEST_ENCODING_DELAY_MS` | 0 | Inject artificial encoding delay (ms), 0=off |
+| `VANE_DEBUG_TIMING` | OFF | Encoding pipeline timing diagnostic logs |
+| `VANE_FAKE_VAAPI` | OFF | Linux: fake encoding mode without DRM (dev/test only) |
 
-## 架构
+## Architecture
 
 ```
-include/Vane/
-  IVideoEncoder.h      # C++ 抽象接口（所有平台编码器实现此接口）
-  VaneConfig.h         # FEncoderConfig 配置 + FEncoderCapability 能力检测
-  VaneCallbacks.h      # C 风格回调类型定义（状态/错误/进度/丢帧）
-  VaneAPI.h            # C ABI 导出接口（跨 DLL / FFI）
+                         ┌──────────────────────┐
+                         │   FEncoderConfig      │
+                         │ (resolution/fps/bitrate..)│
+                         └──────────┬───────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    │      VaneAPI.cpp (C ABI)       │
+                    │  Create / Initialize / Encode  │
+                    └───────────────┬───────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            │                       │                       │
+    ┌───────┴───────┐    ┌─────────┴─────────┐    ┌───────┴───────┐
+    │  FVTEncoder    │    │ FWindowsEncoder   │    │  FVAEncoder    │
+    │  (VideoToolbox)│    │ (facade: runtime   │    │  (VA-API)      │
+    └───────────────┘    │  detection)        │    └───────────────┘
+                         └─────────┬─────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    │              │              │
+            ┌───────┴──────┐ ┌────┴─────┐ ┌──────┴──────┐
+            │ FNvencEncoder │ │FAmfEncoder│ │FMFEncoderNew│
+            │ (NVENC SDK,   │ │ (AMF SDK) │ │  (MF H.264  │
+            │  LoadLibrary) │ │           │ │  + WMV fallback)│
+            └───────────────┘ └───────────┘ └─────────────┘
+                    │
+            ┌───────┴───────┐
+            │ D3D11Converter │
+            │ (BGRA→NV12 GPU)│
+            └───────────────┘
+
+                     Cross-Platform Core
+            ┌─────────────────────┐
+            │  AsyncPipeline       │
+            │  (SPSC lock-free ring buffer)│
+            ├─────────────────────┤
+            │  MP4Writer           │
+            │  (Annex B → avc1)    │
+            ├─────────────────────┤
+            │  ColorSpaceConverter │
+            │  (BGRA → NV12 CPU)   │
+            └─────────────────────┘
+```
+
+## Source Tree
+
+```
+include/Vane/              # Public headers
+  IVideoEncoder.h          # C++ abstract interface (+ VANE_API export macro)
+  VaneConfig.h             # FEncoderConfig + FEncoderCapability
+  VaneCallbacks.h          # C-style callback typedefs
+  VaneAPI.h                # C ABI export interface + platform export macros
 
 src/
-  VaneAPI.cpp          # C ABI 实现（门面模式，通过 #if PLATFORM_XXX 创建对应编码器）
-  AsyncPipeline.cpp    # SPSC 无锁环形队列 + 异步编码管线（所有平台共用）
-
-  core/                # 跨平台核心组件（始终编译）
-    MP4Writer.cpp/h    # 普通 MP4 封装器（Annex B → avc1 + moov），Windows NVENC/AMF 路径使用
-    ColorSpaceConverter.cpp/h  # BGRA → NV12 色彩空间转换
-
-  FVTEncoder.h/.mm     # macOS VideoToolbox（AVAssetWriter 直接写 fMP4）
-  FVAEncoder.h/.cpp    # Linux VA-API（输出裸流 + MP4Muxer 封装 fMP4）
-  FMFEncoder.h/.cpp    # 旧版 Windows MF 编码器（不再编译，仅参考）
-
-  windows/             # Windows 新架构（当前编译）
-    FWindowsEncoder.cpp/h  # 门面类：运行时探测硬件 → NVENC > AMF > MF
-    FNvencEncoder.cpp/h    # NVENC 原生编码器（P0 首选，LoadLibrary 动态加载）
-    FAmfEncoder.cpp/h      # AMD AMF 编码器（P1 备选）
-    FMFEncoderNew.cpp/h    # Media Foundation 编码器（P2 备选，含 WMV 兜底）
-    MFUtils.h              # MF 公共工具（SafeRelease, 宽字符转换, 编码器枚举）
+  VaneAPI.cpp              # C ABI implementation (#if PLATFORM_XXX dispatch)
+  core/                    # Cross-platform core (always compiled)
+    AsyncPipeline.cpp/h    # Async encoding pipeline (SPSC lock-free queue)
+    MP4Writer.cpp/h        # MP4 muxer (Annex B → avc1)
+    ColorSpaceConverter.cpp/h  # Color space conversion (BGRA → NV12 CPU)
+  mac/                     # macOS VideoToolbox
+    FVTEncoder.h/.mm
+  linux/                   # Linux VA-API
+    FVAEncoder.h/.cpp
+    MP4Muxer.cpp/h         # fMP4 muxer
+  windows/                 # Windows multi-encoder
+    FWindowsEncoder.cpp/h  # Facade (NVENC > AMF > MF)
+    FNvencEncoder.cpp/h    # NVENC via LoadLibrary (zero SDK dependency at build)
+    FAmfEncoder.cpp/h      # AMD AMF encoder
+    FMFEncoderNew.cpp/h    # Media Foundation encoder (H.264 + WMV fallback)
+    MFUtils.h              # MF utilities
+    D3D11Converter.cpp/h   # GPU BGRA→NV12 conversion
+  FMFEncoder.cpp/h         # Legacy MF encoder (preserved for reference, not compiled)
 
 test/
-  main.cpp             # 跨平台测试（#if PLATFORM_XXX 选择编码器类）
-  test_mp4writer.cpp   # MP4Writer 单元测试
-  test_d3d11.cpp       # D3D11 设备创建最小测试（仅 Windows）
+  main.cpp                 # Cross-platform main test
+  test_mp4writer.cpp       # MP4Writer unit test (Windows)
+  test_d3d11.cpp           # D3D11 device creation test (Windows)
+  test_all_encoders.cpp    # All-encoder validation (Windows)
 ```
 
-### 关键设计决策
+## C ABI Interface (Primary Integration Point)
 
-- **PIMPL 模式**：所有编码器类头文件只暴露接口，实现细节在 .cpp/.mm 中（`Impl` 结构体）
-- **门面模式 (Windows)**：`FWindowsEncoder` 运行时选择最佳编码器（NVENC > AMF > MF），对外统一 `IVideoEncoder` 接口
-- **动态加载 (NVENC)**：通过 `LoadLibrary("nvEncodeAPI64.dll")` 加载，编译期零 SDK 依赖
-- **MF 引用计数**：`MFStartup`/`MFShutdown` 通过静态引用计数管理，防止进程内多次创建/销毁导致重复初始化
-- **异步管线**：`FAsyncEncodingPipeline` + `FFrameQueue` 提供 SPSC 无锁环形队列，`condition_variable` 唤醒编码线程，`alignas(64)` 消除伪共享
+```c
+#include "Vane/VaneAPI.h"
 
-### 各平台输出封装方式
-
-| 平台 | 编码器 | 封装方式 |
-|---|---|---|
-| macOS | VideoToolbox | AVAssetWriter 直接写 fMP4 |
-| Windows NVENC/AMF | NVENC/AMF SDK | 输出 Annex B 裸流 → `MP4Writer` 封装 MP4 |
-| Windows MF | Media Foundation | MFSinkWriter 直接写 MP4 |
-| Linux | VA-API | 输出 Annex B 裸流 → `MP4Muxer` 封装 fMP4 |
-
-### 回调实现状态
-
-- **macOS (FVTEncoder)**：全部实现（State / Error / Progress / FrameDrop）
-- **Windows (FWindowsEncoder)**：全部实现（通过门面转发到内部编码器的回调）
-- **Linux (FVAEncoder)**：回调为 TODO（`FVAEncoder.cpp:511`），当前继承空默认实现
-
-## 平台隔离
-
-CMake 定义的预处理器宏（`src/CMakeLists.txt` 通过 `target_compile_definitions` 设置）：
-
-```cpp
-#if PLATFORM_MAC       // VideoToolbox
-#elif PLATFORM_WINDOWS  // Media Foundation / NVENC / AMF
-#elif PLATFORM_LINUX   // VA-API
+void* h = VaneEncoder_Create();
+#ifdef _WIN32
+VaneEncoder_SetD3D11Device(h, pD3D11Device);  // Optional: specify GPU
 #endif
+VaneEncoder_Initialize(h, &cfg);
+VaneEncoder_StartRecording(h, "output.mp4");
+VaneEncoder_EncodeFrame(h, bgra, size, timestamp);
+VaneEncoder_RequestStop(h);  // Async, callback notifies completion
+VaneEncoder_Destroy(h);
 ```
 
-各平台链接库：
-- **macOS**: VideoToolbox, CoreMedia, CoreVideo, AVFoundation, Foundation
-- **Windows**: mfplat, mfreadwrite, mfuuid, ole32, d3d11
-- **Linux**: libva, libva-drm（pkg-config 查找）
+Callbacks (`StateCallback`, `ErrorCallback`, `ProgressCallback`, `FrameDropCallback`) fire from the **encoding thread**. UE integrators must forward them to GameThread before touching UI.
 
-## 命名约定
+## Key Design Decisions
 
-- 类名：`F` 前缀 + PascalCase（`FVTEncoder`, `FWindowsEncoder`）
-- 接口：`I` 前缀（`IVideoEncoder`）
-- 函数：PascalCase（`EncodeFrame()`）
-- bool 成员：`b` 前缀（`bIsRecording`）
-- 常量：`k` 前缀（`kDefaultBitRate`）
+- **PIMPL**: All encoder class headers expose only the interface; implementation details live in `.cpp`/`.mm` (`Impl` struct)
+- **Facade pattern (Windows)**: `FWindowsEncoder` probes hardware at runtime → selects best encoder (NVENC > AMF > MF), exposes unified `IVideoEncoder` interface
+- **Dynamic loading (NVENC)**: `LoadLibrary("nvEncodeAPI64.dll")` at runtime, zero SDK dependency at build time; headers auto-downloaded by CMake
+- **Real encoding session probing (NVENC)**: `IsH264Supported()` opens a temporary encoding session to verify, cached per D3D11 device pointer
+- **MF reference counting**: `MFStartup`/`MFShutdown` managed via static refcount to prevent repeated init/shutdown within a process
+- **Async pipeline**: SPSC lock-free ring buffer + `condition_variable` wakeup + `alignas(64)` to eliminate false sharing
+- **VANE_API export macro**: Cross-platform `__declspec(dllexport/dllimport)` / `visibility("default")` ensures correct symbol export from DLL/dylib/so
 
-## 行为规则
+## Platform Encapsulation
 
-1. **先想后问**：对平台 API 不确定时查阅文档或提出疑问，不要凭猜测写代码
-2. **极简优先**：不添加未要求的功能，不过度抽象，用最少代码解决问题
-3. **精准修改**：修改某平台实现时不顺手"优化"其他平台；修改接口时必须同步更新所有平台实现
-4. **目标驱动**：代码能编译通过，测试程序能生成有效视频文件
+| Platform | Encoder | Muxer |
+|---|---|---|
+| macOS | VideoToolbox | AVAssetWriter writes fMP4 directly |
+| Windows NVENC/AMF | NVENC/AMF SDK | Output Annex B → MP4Writer muxes MP4 |
+| Windows MF H.264 | Media Foundation MFT | Output Annex B → MP4Writer muxes MP4 |
+| Windows MF WMV | Media Foundation SinkWriter | Writes ASF directly |
+| Linux | VA-API | Output Annex B → MP4Muxer muxes fMP4 |
 
-## 禁止事项
+## Platform Macros
 
-- 不引入 FFmpeg 或其他第三方视频库
-- 不实现网络流媒体功能
-- 不添加 GUI 界面
-- 不修改 C++17 标准
+CMake sets `PLATFORM_MAC`, `PLATFORM_WINDOWS`, `PLATFORM_LINUX` via `target_compile_definitions` in `src/CMakeLists.txt`. Code uses `#if PLATFORM_XXX` to isolate platform-specific paths.
+
+**Link libraries:**
+- macOS: VideoToolbox, CoreMedia, CoreVideo, AVFoundation, Foundation
+- Windows: mfplat, mfreadwrite, mfuuid, ole32, d3d11
+- Linux: libva, libva-drm (via pkg-config)
+
+## Naming Conventions
+
+- Classes: `F` prefix + PascalCase (`FVTEncoder`, `FWindowsEncoder`)
+- Interfaces: `I` prefix (`IVideoEncoder`)
+- Functions: PascalCase (`EncodeFrame()`)
+- bool members: `b` prefix (`bIsRecording`)
+- Constants: `k` prefix (`kDefaultBitRate`)
+
+## Callback Implementation Status
+
+- **macOS (FVTEncoder)**: All implemented (State / Error / Progress / FrameDrop)
+- **Windows (FWindowsEncoder)**: All implemented (forwarded through facade to internal encoder callbacks)
+- **Linux (FVAEncoder)**: Callbacks are TODO (`FVAEncoder.cpp:511`), currently inheriting empty default implementations
+
+## Constraints
+
+- Do NOT introduce FFmpeg or other third-party video libraries
+- Do NOT implement network streaming functionality
+- Do NOT add GUI interfaces
+- Do NOT change the C++17 standard
+- When modifying one platform's implementation, do NOT casually "optimize" other platforms
+- When modifying the interface, MUST synchronize updates across all platform implementations
